@@ -1,0 +1,53 @@
+# T0 long-recording test set: how components behave on 30 s - 5 min audio, where models
+# cut the input into windows. Kept apart from t0-components so the ASR benchmark on a
+# laptop stays short. Revisions marked PIN are resolved before building.
+name: t0-long
+seed: 20261128
+sample_rate: 16000
+
+speech:
+  - source:
+      type: hf
+      name: librispeech_en_long
+      dataset: gilkeyio/librispeech-alignments
+      revision: 0daa1eb43dda38ee6ce752e785555380e5628f5c
+      split: test_clean
+      id_column: id
+      text_column: transcript
+      transcripts: reference
+      speech_segments_column: words
+      meta_columns: [sex]
+      language: en
+      license: CC-BY-4.0
+    take: 10
+    concat: {seconds: [30, 300], gap: [0.3, 1.0], group_by: id_prefix, separator: "-"}
+
+backgrounds:
+  music:
+    source:
+      type: hf
+      name: musan_music
+      dataset: Akiki-AI/akiki-vad-silero623-v1-musan-music-cc-by-3.0
+      revision: 20f2d02ac697dc7bb56bed8e7c2012072ea3fa20
+      split: train
+      id_column: sample_id
+      license: CC-BY-3.0
+  noise:
+    source:
+      type: hf
+      name: musan_noise
+      dataset: Akiki-AI/akiki-vad-silero623-v1-musan-noise
+      revision: 4eff67313a8e62bb6d054af54593f038d267c90f
+      split: train
+      id_column: sample_id
+      meta_columns: [audio_license]
+      license: per-recording
+    license_column: audio_license
+    licenses: [CC-BY-4.0, CC-BY-3.0, public-domain]
+
+conditions:
+  - name: clean
+  - {name: noise_snr10, ops: [{mix: {background: noise, snr_db: 10}}]}
+  - {name: music_snr10, ops: [{mix: {background: music, snr_db: 10}}]}
+  - {name: pad_floor, ops: [{pad: {before: [5, 20], after: [5, 20], fill: floor}}]}
+  - {name: telephone, ops: [{resample: 8000}, {codec: pcm_mulaw}]}

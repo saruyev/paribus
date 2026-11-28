@@ -52,8 +52,8 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-mypy_path = "src"
-packages = ["paribus"]
+mypy_path = "src:."
+packages = ["paribus", "testsets"]
 
 [[tool.mypy.overrides]]
 # These ship no type hints.
@@ -67,6 +67,8 @@ disallow_any_generics = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The repository root, so tests can import the `testsets` package that lives outside src/.
+pythonpath = ["."]
 addopts = "--import-mode=importlib"
 markers = ["integration: needs more than unit scope"]
 filterwarnings = [
@@ -84,4 +86,5 @@ dev = [
     "pytest>=9.2.0",
     "pytest-cov>=7.1.0",
     "ruff>=0.17.6",
+    "types-pyyaml>=6.0.12.20261122",
 ]

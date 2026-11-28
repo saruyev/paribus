@@ -32,8 +32,8 @@ class HFDatasetSource:
     """Reads one split of a Hub dataset at a pinned revision.
 
     Audio files are cached under
-    `<cache_dir>/<dataset>/<revision>/<subset>/<split>/<row index>.<ext>`; the extension
-    comes from the file name the dataset stores with the audio. Ids come from
+    `<cache_dir>/<dataset>/<revision>/<subset>[/<data_dir>]/<split>/<row index>.<ext>`;
+    the extension comes from the file name the dataset stores with the audio. Ids come from
     `id_column`, or are `<split>/<row index>`. The source is named after the dataset
     unless the config names it.
     """
@@ -43,13 +43,15 @@ class HFDatasetSource:
         self.config = config
         self.name = config.name or config.dataset
         self.license = config.license
-        self._cache = (
+        cache = (
             (config.cache_dir or DEFAULT_CACHE_DIR)
             / config.dataset
             / _safe(config.revision)
             / _safe(config.subset or "default")
-            / config.split
-        ).resolve()
+        )
+        if config.data_dir is not None:  # two folders of one dataset must not share a cache
+            cache = cache / _safe(config.data_dir)
+        self._cache = (cache / config.split).resolve()
 
     def records(self) -> Iterator[SampleRecord]:
         """Read and cache every row (up to `limit`), then yield the records in row order.
@@ -91,6 +93,7 @@ class HFDatasetSource:
         stream = datasets.load_dataset(
             config.dataset,
             name=config.subset,
+            data_dir=config.data_dir,
             split=config.split,
             revision=config.revision,
             streaming=True,
@@ -99,7 +102,7 @@ class HFDatasetSource:
         return itertools.islice(stream, config.limit)
 
     def _to_record(self, index: int, row: Mapping[str, Any]) -> SampleRecord:
-        """Build the record for one row: cache its audio, take id and transcript if set."""
+        """Build the record for one row: cache its audio, take the configured columns."""
         config = self.config
         record_id = (
             str(_column(row, config.id_column)) if config.id_column else f"{config.split}/{index}"
@@ -115,6 +118,11 @@ class HFDatasetSource:
                 record["reference"] = text
             else:
                 record["output"] = {"text": text}
+        if config.meta_columns:
+            record["meta"] = {name: _column(row, name) for name in config.meta_columns}
+        if config.speech_segments_column is not None:
+            spans = _column(row, config.speech_segments_column)
+            record["speech_segments"] = _spans(spans, config.speech_segments_column)
         return SampleRecord.model_validate(record)
 
     def _cache_audio(self, index: int, audio: Any) -> Path:
@@ -157,6 +165,26 @@ def _column(row: Mapping[str, Any], name: str) -> Any:
     if name not in row:
         raise ValueError(f"no column {name!r}, columns are: {', '.join(row)}")
     return row[name]
+
+
+def _spans(value: Any, column: str) -> list[tuple[Any, Any]]:
+    """Read speech spans from a column value as (start, end) pairs.
+
+    Accepted shapes: a list of `{start, end}` items, a list of `[start, end]` pairs, or
+    the column-wise form `{start: [...], end: [...]}` that `datasets` uses for sequences
+    of structs. Values are checked by `SampleRecord`, not here.
+
+    Raises:
+        ValueError: If the value has none of these shapes.
+    """
+    if isinstance(value, Mapping) and "start" in value and "end" in value:
+        return list(zip(value["start"], value["end"], strict=True))
+    if isinstance(value, list):
+        if all(isinstance(item, Mapping) and "start" in item and "end" in item for item in value):
+            return [(item["start"], item["end"]) for item in value]
+        if all(isinstance(item, list | tuple) and len(item) == 2 for item in value):
+            return [(start, end) for start, end in value]
+    raise ValueError(f"column {column!r} must hold spans with start and end")
 
 
 def _safe(part: str) -> str:

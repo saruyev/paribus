@@ -82,6 +82,7 @@ def test_hub_is_asked_for_the_pinned_revision_as_a_stream(
     assert hub["call"] == {
         "path": _DATASET,
         "name": "clean",
+        "data_dir": None,
         "split": "test",
         "revision": _REVISION,
         "streaming": True,
@@ -198,3 +199,53 @@ def test_build_source_builds_an_hf_source() -> None:
 
     assert isinstance(source, HFDatasetSource)
     assert source.name == _DATASET
+
+
+def test_meta_columns_are_copied_into_meta(tmp_path: Path, hub: dict[str, Any]) -> None:
+    """Configured scalar columns become metadata that slice search can use."""
+    hub["rows"] = {"audio": _wav(tmp_path, "x"), "sex": ["F"], "speaker": [1089]}
+
+    (record,) = _source(tmp_path, meta_columns=["sex", "speaker"]).records()
+
+    assert record.meta == {"sex": "F", "speaker": 1089}
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        [{"word": "hi", "start": 0.5, "end": 0.9}, {"word": "there", "start": 1.0, "end": 1.4}],
+        [[0.5, 0.9], [1.0, 1.4]],
+    ],
+)
+def test_speech_segments_come_from_aligned_spans(
+    tmp_path: Path, hub: dict[str, Any], words: list[Any]
+) -> None:
+    """Word alignments become ground-truth speech spans; extra keys like `word` are ignored."""
+    hub["rows"] = {"audio": _wav(tmp_path, "x"), "words": [words]}
+
+    (record,) = _source(tmp_path, speech_segments_column="words").records()
+
+    assert record.speech_segments == [(0.5, 0.9), (1.0, 1.4)]
+
+
+def test_speech_segments_of_the_wrong_shape_are_reported(
+    tmp_path: Path, hub: dict[str, Any]
+) -> None:
+    """A column that is not spans fails on its row instead of being guessed at."""
+    hub["rows"] = {"audio": _wav(tmp_path, "x"), "words": [["hi", "there"]]}
+
+    with pytest.raises(SourceError) as error:
+        list(_source(tmp_path, speech_segments_column="words").records())
+
+    assert error.value.issues[0].message == "column 'words' must hold spans with start and end"
+
+
+def test_a_data_dir_is_read_and_cached_on_its_own(tmp_path: Path, hub: dict[str, Any]) -> None:
+    """A folder of a dataset is passed to the Hub and gets its own cache folder."""
+    hub["rows"] = {"audio": _wav(tmp_path, "x")}
+
+    (record,) = _source(tmp_path, data_dir="ru_ru").records()
+
+    assert hub["call"]["data_dir"] == "ru_ru"
+    cache = tmp_path / "cache" / _DATASET / _REVISION / "default" / "ru_ru" / "test"
+    assert record.audio == cache.resolve() / "000000.wav"

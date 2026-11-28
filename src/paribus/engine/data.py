@@ -303,12 +303,20 @@ class HFConfig(SourceConfig):
         revision: Commit sha or tag to read. Required, because a dataset can change under
             a branch name, and then two runs would quietly read different data.
         subset: The dataset's configuration (`name` in `datasets.load_dataset`), if any.
+        data_dir: A folder inside the dataset to read, for datasets laid out as folders
+            rather than configurations, such as the parquet conversion of a script
+            dataset (`google/fleurs` at `refs/convert/parquet` keeps `ru_ru/test/...`).
         split: Split to read, e.g. `test`.
         audio_column: Column holding the audio.
         text_column: Column holding a transcript; needed when `transcripts` is not `none`.
         transcripts: What `text_column` is: a gold `reference` or a pipeline `output`.
         id_column: Column holding record ids; without it ids are `<split>/<index>`.
         language: Expected language of every record, if known.
+        meta_columns: Columns copied into each record's `meta` (speaker, sex, a clip's
+            own license), so slice search can use them. Values must be scalars.
+        speech_segments_column: Column holding ground-truth speech spans, e.g. forced
+            alignments of words: a list of `{start, end}` items (other keys ignored) or
+            of `[start, end]` pairs, in seconds. It becomes `speech_segments`.
         limit: Read only the first `limit` rows, so a big dataset is not read in full.
         cache_dir: Where audio files are written; defaults to `~/.cache/paribus/hf`.
     """
@@ -317,12 +325,15 @@ class HFConfig(SourceConfig):
     dataset: str = Field(min_length=1)
     revision: str = Field(min_length=1)
     subset: str | None = None
+    data_dir: str | None = None
     split: str = Field(min_length=1)
     audio_column: str = "audio"
     text_column: str | None = None
     transcripts: Literal["none", "reference", "output"] = "none"
     id_column: str | None = None
     language: str | None = None
+    meta_columns: list[str] = Field(default_factory=list)
+    speech_segments_column: str | None = None
     limit: int | None = Field(default=None, ge=1)
     cache_dir: Path | None = None
 
