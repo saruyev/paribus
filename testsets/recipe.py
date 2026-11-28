@@ -8,6 +8,8 @@ Settings that vary from clip to clip are a `Range`: a number for a fixed value, 
 `[low, high]` for a value drawn uniformly per clip from the recipe's seed.
 """
 
+import importlib
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, Protocol, Self
@@ -38,6 +40,8 @@ def _ordered(value: float | tuple[float, float]) -> float | tuple[float, float]:
 
 type Range = Annotated[float | tuple[float, float], AfterValidator(_ordered)]
 
+# A dotted Python module name, as `plugins` lists them.
+_MODULE = r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$"
 # Fill names that `pad` and `generate` understand without a background of that name.
 _BUILT_IN_FILLS = ("zero", "floor")
 
@@ -410,10 +414,14 @@ class Recipe(_Model):
         speech: Sources of the phrases that every speech condition corrupts.
         backgrounds: Background pools by name, referred to by `mix`, `pad` and `generate`.
         conditions: The corruptions; names must be unique.
+        plugins: Python modules with your own operations, imported by `load_recipe`
+            before the conditions are read. Kept here so `sources.json` says which
+            code a set was built with.
     """
 
     name: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
     seed: int
+    plugins: list[Annotated[str, Field(pattern=_MODULE)]] = Field(default_factory=list)
     sample_rate: int = Field(default=16000, gt=0)
     speech: list[SpeechInput] = Field(min_length=1)
     backgrounds: dict[str, Background] = Field(default_factory=dict)
@@ -446,10 +454,41 @@ class Recipe(_Model):
 
 
 def load_recipe(path: Path) -> Recipe:
-    """Read and validate a recipe file.
+    """Read a recipe file, import its `plugins`, and validate it.
+
+    Plugins are imported first because the conditions can name operations they
+    register. A plugin is found on `sys.path` or next to the recipe file.
 
     Raises:
+        ImportError: If a plugin cannot be imported (the cause is chained).
         ValidationError: If the recipe does not match the models above.
     """
     with path.open(encoding="utf-8") as handle:
-        return Recipe.model_validate(yaml.safe_load(handle))
+        raw = yaml.safe_load(handle)
+    plugins = raw.get("plugins") if isinstance(raw, dict) else None
+    if isinstance(plugins, list):
+        _import_plugins([str(name) for name in plugins], path.resolve().parent)
+    return Recipe.model_validate(raw)
+
+
+def _import_plugins(names: list[str], folder: Path) -> None:
+    """Import each module, looking in `folder` too, so their `register_op` calls run.
+
+    Raises:
+        ImportError: If a module is not found, naming it and the recipe's folder; an
+            import that fails inside the module is raised as it is.
+    """
+    sys.path.insert(0, str(folder))
+    try:
+        for name in names:
+            try:
+                importlib.import_module(name)
+            except ModuleNotFoundError as error:
+                missing = error.name or ""
+                if name != missing and not name.startswith(missing + "."):
+                    raise  # the plugin exists, but something it imports does not
+                raise ImportError(
+                    f"recipe plugin {name!r} not found on sys.path or in {folder}"
+                ) from error
+    finally:
+        sys.path.remove(str(folder))

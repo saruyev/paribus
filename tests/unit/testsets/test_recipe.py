@@ -163,3 +163,42 @@ def test_an_operation_name_cannot_be_registered_twice() -> None:
         @register_op("mix")
         class _Mine(Operation):
             """Another `mix`."""
+
+
+def test_plugins_next_to_the_recipe_register_their_operations(tmp_path: Path) -> None:
+    """A module beside the recipe is imported first, so its operation can be used."""
+    (tmp_path / "recipe_test_plugin.py").write_text(
+        "from testsets import Operation, register_op\n"
+        "\n"
+        "@register_op('test_plugin_op')\n"
+        "class Nothing(Operation):\n"
+        "    level: float = 0.0\n",
+        encoding="utf-8",
+    )
+    path = _recipe(
+        tmp_path,
+        plugins=["recipe_test_plugin"],
+        conditions=[{"name": "x", "ops": [{"test_plugin_op": {"level": 2}}]}],
+    )
+
+    recipe = load_recipe(path)
+
+    assert recipe.plugins == ["recipe_test_plugin"]
+    assert type(recipe.conditions[0].ops[0]).__name__ == "Nothing"
+
+
+def test_a_missing_plugin_names_itself(tmp_path: Path) -> None:
+    """A typo in `plugins` says which module and where it was looked for."""
+    path = _recipe(tmp_path, plugins=["no_such_plugin_here"])
+
+    with pytest.raises(ImportError, match="'no_such_plugin_here' not found"):
+        load_recipe(path)
+
+
+def test_an_error_inside_a_plugin_is_not_hidden(tmp_path: Path) -> None:
+    """A plugin that exists but imports something missing reports the real cause."""
+    (tmp_path / "recipe_broken_plugin.py").write_text("import no_such_dependency\n")
+    path = _recipe(tmp_path, plugins=["recipe_broken_plugin"])
+
+    with pytest.raises(ModuleNotFoundError, match="no_such_dependency"):
+        load_recipe(path)

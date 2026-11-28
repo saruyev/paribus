@@ -425,7 +425,12 @@ def _write_sources(path: Path, run: _Build) -> None:
                 "clips_used": pool.used.total(),
             }
         )
-    document = {"recipe": recipe.name, "seed": recipe.seed, "inputs": inputs}
+    document = {
+        "recipe": recipe.name,
+        "seed": recipe.seed,
+        "plugins": recipe.plugins,
+        "inputs": inputs,
+    }
     path.write_text(json.dumps(document, indent=2, default=str) + "\n", encoding="utf-8")
 
 
