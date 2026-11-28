@@ -74,8 +74,8 @@ speech:
       type: hf
       name: fleurs_ru                 # becomes part of every clip id
       dataset: google/fleurs
-      revision: 0123abcd...           # a commit sha, never a branch
-      subset: ru_ru
+      revision: 0123abcd...           # a commit of refs/convert/parquet, never a branch
+      data_dir: ru_ru                 # FLEURS keeps each language in a folder
       split: test
       text_column: raw_transcription
       transcripts: reference          # the column is gold, not a model's output
@@ -177,7 +177,8 @@ Every source has these settings:
 |---|---|---|
 | `dataset` | | The repository id, e.g. `google/fleurs`. |
 | `revision` | | A commit sha or tag. It is required, so two builds never read different data. |
-| `subset` | none | The dataset's configuration, e.g. `ru_ru`. |
+| `subset` | none | The dataset's configuration (`name` in `datasets.load_dataset`). |
+| `data_dir` | none | A folder inside the dataset, for datasets laid out as folders rather than configurations. See below. |
 | `split` | | e.g. `test`. |
 | `audio_column` | `audio` | The column holding the audio. |
 | `text_column` | none | The column holding a transcript. |
@@ -188,6 +189,14 @@ Every source has these settings:
 | `speech_segments_column` | none | The column of `{start, end}` spans or `[start, end]` pairs, in seconds. |
 | `limit` | none | Read only the first N rows. |
 | `cache_dir` | `~/.cache/paribus/hf` | Where audio files are cached. |
+
+**`subset` or `data_dir`?** Look at the dataset's file tree on the Hub. If the dataset
+lists configurations, pick one with `subset`. If it is a tree of folders such as
+`ru_ru/test/0000.parquet`, name the folder with `data_dir`, and the split comes from the
+folder below it. Script datasets such as `google/fleurs` can only be read through their
+parquet conversion, the `refs/convert/parquet` branch. There, a pinned commit shows
+folders, not configurations, so FLEURS needs `data_dir`. Each `data_dir` gets its own
+cache folder.
 
 **`folder`**: every audio file under a folder, recursively.
 
