@@ -195,6 +195,7 @@ def _load_phrases(recipe: Recipe) -> list[Phrase]:
         rng = np.random.default_rng([recipe.seed, number])
         candidates = _candidates(speech, _fixed_rate(recipe))
         if speech.concat is not None:
+            _check_one_rate(candidates, number)
             packer = _Packer(speech.concat, np.random.default_rng([recipe.seed, number, 1]))
             candidates = packer.pack(candidates)
         if len(candidates) < speech.take:
@@ -209,6 +210,24 @@ def _load_phrases(recipe: Recipe) -> list[Phrase]:
     if len(set(keys)) != len(keys):
         raise ValueError("two speech inputs share a source name; give them distinct `name`s")
     return phrases
+
+
+def _check_one_rate(phrases: list[Phrase], number: int) -> None:
+    """Require one sample rate across the phrases that `concat` joins.
+
+    With a fixed recipe rate this always holds. With `native` the files must already
+    agree, because joining 8 kHz and 16 kHz audio would need a silent resample.
+
+    Raises:
+        ValueError: If the phrases have more than one rate, listing them.
+    """
+    rates = sorted({phrase.clip.sample_rate for phrase in phrases})
+    if len(rates) > 1:
+        listed = ", ".join(str(rate) for rate in rates)
+        raise ValueError(
+            f"speech input {number} joins phrases with concat, but they have different "
+            f"sample rates ({listed} Hz); set the recipe's sample_rate to one rate"
+        )
 
 
 def _fixed_rate(recipe: Recipe) -> int | None:

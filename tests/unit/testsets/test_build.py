@@ -12,7 +12,7 @@ import pytest
 from paribus.engine.data import ManifestConfig, ManifestSource
 from testsets import Clip, OpContext, Operation, Range, register_op
 from testsets.build import build
-from testsets.recipe import Recipe
+from testsets.recipe import Concat, Recipe
 
 _RATE = 16000
 
@@ -382,3 +382,22 @@ def test_generate_has_its_own_rate(inputs: Path, tmp_path: Path) -> None:
     out = tmp_path / "out" / "tiny"
     assert _rate_of(out / rows["z16"]["audio"]) == 16000
     assert _rate_of(out / rows["z8"]["audio"]) == 8000
+
+
+def test_concat_needs_one_sample_rate(tmp_path: Path) -> None:
+    """Under `native`, phrases of different rates cannot be joined; a fixed rate joins them."""
+    _write_tone(tmp_path / "speech" / "b-1-0.wav", 1.0, 300, rate=8000)
+    _write_tone(tmp_path / "speech" / "b-1-1.wav", 1.0, 400)
+    _write_tone(tmp_path / "music" / "m0.wav", 1.0, 1000)
+    recipe = _recipe(tmp_path, take=1, sample_rate="native")
+    speech = recipe.speech[0].model_copy(
+        update={"duration": None, "concat": Concat(seconds=(1.5, 3), gap=0.5)}
+    )
+    recipe = recipe.model_copy(update={"speech": [speech]})
+
+    with pytest.raises(ValueError, match=r"different sample rates \(8000, 16000 Hz\)"):
+        build(recipe, tmp_path / "out")
+
+    fixed = recipe.model_copy(update={"sample_rate": 16000})
+    (row,) = _rows(build(fixed, tmp_path / "out"))
+    assert row["meta"]["concat_parts"] == 2
