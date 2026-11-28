@@ -48,12 +48,22 @@ class Clip:
         """Number of frames in the clip."""
         return int(self.samples.shape[0])
 
+    @property
+    def seconds(self) -> float:
+        """Length of the clip in seconds."""
+        return self.frames / self.sample_rate
+
 
 def draw(value: float | tuple[float, float], rng: np.random.Generator) -> float:
     """Return a fixed value as is, or a uniform draw from a `(low, high)` range."""
     if isinstance(value, tuple):
         return float(rng.uniform(value[0], value[1]))
     return float(value)
+
+
+def bounds(value: float | tuple[float, float]) -> tuple[float, float]:
+    """The `(low, high)` of a range; a fixed value is a range of one point."""
+    return value if isinstance(value, tuple) else (value, value)
 
 
 def zeros(frames: int) -> Samples:
@@ -105,6 +115,21 @@ def pad(clip: Clip, before: Samples, after: Samples) -> Clip:
     samples = np.concatenate([before, clip.samples, after]).astype(np.float32)
     speech = [(start + shift, end + shift) for start, end in clip.speech]
     return replace(clip, samples=samples, speech=speech)
+
+
+def join(first: Clip, silence: Samples, second: Clip) -> Clip:
+    """Play `first`, then `silence`, then `second`, keeping the speech spans of both.
+
+    It is `pad` of the second clip by everything before it, so the shifting of speech
+    spans lives in one place.
+
+    Raises:
+        ValueError: If the clips have different sample rates.
+    """
+    if first.sample_rate != second.sample_rate:
+        raise ValueError(f"cannot join {first.sample_rate} Hz and {second.sample_rate} Hz")
+    moved = pad(second, np.concatenate([first.samples, silence]), zeros(0))
+    return replace(moved, speech=[*first.speech, *moved.speech])
 
 
 def generate(fill: Samples, sample_rate: int) -> Clip:

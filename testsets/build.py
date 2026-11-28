@@ -19,7 +19,7 @@ import wave
 import zlib
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -58,11 +58,9 @@ class Phrase:
         record_id: Id of the (first) source record, used for grouping and ordering.
         language: Expected language, from the source record.
         reference: Gold transcript, if the source has one.
-        samples: Mono audio at `sample_rate` (the recipe's).
-        speech: Ground-truth speech spans in seconds.
+        clip: Mono audio at the recipe's sample rate, with ground-truth speech spans.
         truth: `alignment` if the spans come from the source, `utterance_bounds` if
             they are just the whole phrase.
-        sample_rate: Frames per second of `samples`.
         meta: The source record's metadata, plus what `concat` adds; it goes into the
             built record, so slice search can use the source's own columns.
     """
@@ -71,24 +69,30 @@ class Phrase:
     record_id: str
     language: str | None
     reference: str | None
-    samples: Samples
-    speech: list[ops.Span]
+    clip: Clip
     truth: str
-    sample_rate: int
     meta: dict[str, MetaValue] = field(default_factory=dict)
-
-    @property
-    def seconds(self) -> float:
-        """Length of the phrase in seconds."""
-        return float(self.samples.shape[0] / self.sample_rate)
 
 
 @dataclass(frozen=True)
 class Pool:
-    """Background clips of one recipe background, decoded at the recipe's sample rate."""
+    """Background clips of one recipe background, decoded at the recipe's sample rate.
+
+    Attributes:
+        clips: (clip id, samples) pairs.
+        licenses: Number of clips in the pool under each license, for `sources.json`.
+        used: How many built clips took a stretch of this pool, for `sources.json`.
+    """
 
     clips: list[tuple[str, Samples]]
     licenses: Counter[str] = field(default_factory=Counter)
+    used: Counter[str] = field(default_factory=Counter)
+
+    def pick(self, rng: np.random.Generator) -> tuple[str, Samples]:
+        """Choose one clip at random and count it as used."""
+        clip_id, samples = self.clips[int(rng.integers(len(self.clips)))]
+        self.used[clip_id] += 1
+        return clip_id, samples
 
 
 @dataclass
@@ -145,14 +149,14 @@ def build(recipe: Recipe, out_dir: Path, force: bool = False) -> Path:
         name: _load_pool(background, recipe.sample_rate)
         for name, background in recipe.backgrounds.items()
     }
-    run = _Build(recipe, pools, Counter())
+    run = _Build(recipe, pools)
     records = [
         _write_clip(partial, made)
         for condition in recipe.conditions
         for made in run.clips(condition, phrases)
     ]
     _write_manifest(partial / "manifest.jsonl", records)
-    _write_sources(partial / "sources.json", recipe, pools, run.used)
+    _write_sources(partial / "sources.json", run)
     shutil.rmtree(target, ignore_errors=True)
     partial.rename(target)
     return target / "manifest.jsonl"
@@ -170,8 +174,8 @@ def _load_phrases(recipe: Recipe) -> list[Phrase]:
         rng = np.random.default_rng([recipe.seed, number])
         candidates = _candidates(speech, recipe.sample_rate)
         if speech.concat is not None:
-            concat_rng = np.random.default_rng([recipe.seed, number, 1])
-            candidates = _concatenate(candidates, speech.concat, concat_rng, recipe.sample_rate)
+            packer = _Packer(speech.concat, np.random.default_rng([recipe.seed, number, 1]))
+            candidates = packer.pack(candidates)
         if len(candidates) < speech.take:
             kind = "long clips" if speech.concat else "phrases within its duration filter"
             raise ValueError(
@@ -191,122 +195,120 @@ def _candidates(speech: SpeechInput, sample_rate: int) -> list[Phrase]:
     source = build_source(speech.source)
     candidates = []
     for record in source.records():
-        samples = load_audio(record, sample_rate).mono()
-        duration = samples.shape[0] / sample_rate
-        if speech.duration is not None and not speech.duration[0] <= duration <= speech.duration[1]:
-            continue
         spans = record.speech_segments
+        clip = Clip(load_audio(record, sample_rate).mono(), sample_rate, list(spans or []))
+        if speech.duration is not None and not (
+            speech.duration[0] <= clip.seconds <= speech.duration[1]
+        ):
+            continue
+        if spans is None:  # no ground truth from the source: the whole phrase is speech
+            clip = replace(clip, speech=[(0.0, clip.seconds)])
         candidates.append(
             Phrase(
                 key=f"{source.name}/{record.id}",
                 record_id=record.id,
                 language=record.language,
                 reference=record.reference,
-                samples=samples,
-                speech=list(spans) if spans is not None else [(0.0, duration)],
+                clip=clip,
                 truth="alignment" if spans is not None else "utterance_bounds",
-                sample_rate=sample_rate,
                 meta=dict(record.meta),
             )
         )
     return candidates
 
 
-def _concatenate(
-    phrases: list[Phrase], concat: Concat, rng: np.random.Generator, sample_rate: int
-) -> list[Phrase]:
-    """Join consecutive phrases of each group into long clips of the drawn lengths.
+@dataclass(frozen=True)
+class _Packer:
+    """Joins consecutive phrases of each group into long clips of the drawn lengths.
 
-    Groups are visited in order of their key and phrases in order of their record id, so
-    the parts of a clip follow each other as in the source (a book chapter, read aloud).
+    Attributes:
+        concat: The input's `concat` settings.
+        rng: Generator for target lengths and gaps, separate from phrase selection, so
+            adding `concat` to one input does not change what other inputs pick.
     """
-    groups: dict[str, list[Phrase]] = {}
-    for phrase in phrases:
-        groups.setdefault(_group_of(phrase, concat), []).append(phrase)
-    joined: list[Phrase] = []
-    for group, members in sorted(groups.items()):
-        ordered = sorted(members, key=lambda member: member.record_id)
-        joined.extend(_pack(ordered, concat, rng, group, sample_rate))
-    return joined
 
+    concat: Concat
+    rng: np.random.Generator
 
-def _pack(
-    phrases: list[Phrase], concat: Concat, rng: np.random.Generator, group: str, sample_rate: int
-) -> list[Phrase]:
-    """Pack one group's phrases, in order, into clips between the `seconds` bounds.
+    def pack(self, phrases: list[Phrase]) -> list[Phrase]:
+        """Group phrases and pack each group, in group-key order, into long clips.
 
-    A clip is closed when it reaches its drawn target, or early when the next phrase
-    would push it past the high bound. A clip shorter than the low bound is dropped.
-    """
-    low, high = concat.seconds if isinstance(concat.seconds, tuple) else (concat.seconds,) * 2
-    packed: list[Phrase] = []
-    current: list[tuple[float, Phrase]] = []  # (silence before, phrase)
-    target = ops.draw(concat.seconds, rng)
+        Within a group phrases follow their record ids, so the parts of a clip follow
+        each other as in the source (a book chapter, read aloud).
+        """
+        groups: dict[str, list[Phrase]] = {}
+        for phrase in phrases:
+            groups.setdefault(self._group_of(phrase), []).append(phrase)
+        packed: list[Phrase] = []
+        for group, members in sorted(groups.items()):
+            ordered = sorted(members, key=lambda member: member.record_id)
+            packed.extend(self._pack_group(group, ordered))
+        return packed
 
-    def close() -> None:
-        """Keep the current clip if it is long enough, and start the next one."""
-        nonlocal current, target
-        if current and _length(current) >= low:
-            packed.append(_join(current, group, sample_rate))
-        current, target = [], ops.draw(concat.seconds, rng)
+    def _pack_group(self, group: str, phrases: list[Phrase]) -> list[Phrase]:
+        """Pack one group's phrases, in order, into clips between the `seconds` bounds.
 
-    for phrase in phrases:
-        gap = ops.draw(concat.gap, rng) if current else 0.0
-        if current and _length(current) + gap + phrase.seconds > high:
-            close()
-            gap = 0.0
-        current.append((gap, phrase))
-        if _length(current) >= target:
-            close()
-    close()
-    return packed
+        A clip is closed when it reaches its drawn target, or early when the next phrase
+        would push it past the high bound. A clip shorter than the low bound is dropped.
+        """
+        low, high = ops.bounds(self.concat.seconds)
+        packed: list[Phrase] = []
+        current: list[tuple[float, Phrase]] = []  # (silence before, phrase)
+        target = ops.draw(self.concat.seconds, self.rng)
+
+        def close() -> None:
+            """Keep the current clip if it is long enough, and start the next one."""
+            nonlocal current, target
+            if current and _length(current) >= low:
+                packed.append(self._join(group, current))
+            current, target = [], ops.draw(self.concat.seconds, self.rng)
+
+        for phrase in phrases:
+            gap = ops.draw(self.concat.gap, self.rng) if current else 0.0
+            if current and _length(current) + gap + phrase.clip.seconds > high:
+                close()
+                gap = 0.0
+            current.append((gap, phrase))
+            if _length(current) >= target:
+                close()
+        close()
+        return packed
+
+    def _group_of(self, phrase: Phrase) -> str:
+        """The group a phrase belongs to: its id prefix, or a value from its metadata.
+
+        Raises:
+            ValueError: If grouping by a `meta` key the phrase does not have.
+        """
+        if self.concat.group_by == "id_prefix":
+            return phrase.record_id.rsplit(self.concat.separator, 1)[0]
+        if self.concat.group_by not in phrase.meta:
+            raise ValueError(f"phrase {phrase.key} has no meta {self.concat.group_by!r}")
+        return str(phrase.meta[self.concat.group_by])
+
+    def _join(self, group: str, parts: list[tuple[float, Phrase]]) -> Phrase:
+        """Join phrases into one with `ops.join`, each after its silence."""
+        phrases = [phrase for _, phrase in parts]
+        first = phrases[0]
+        clip = first.clip
+        for gap, phrase in parts[1:]:
+            clip = ops.join(clip, ops.zeros(int(gap * clip.sample_rate)), phrase.clip)
+        references = [phrase.reference for phrase in phrases if phrase.reference]
+        aligned = all(phrase.truth == "alignment" for phrase in phrases)
+        return Phrase(
+            key=f"{first.key}+{len(phrases)}",
+            record_id=first.record_id,
+            language=first.language,
+            reference=" ".join(references) if references else None,
+            clip=clip,
+            truth="alignment" if aligned else "utterance_bounds",
+            meta={**first.meta, "concat_parts": len(phrases), "concat_group": group},
+        )
 
 
 def _length(parts: list[tuple[float, Phrase]]) -> float:
     """Length in seconds of phrases joined with their silences."""
-    return sum(gap + phrase.seconds for gap, phrase in parts)
-
-
-def _group_of(phrase: Phrase, concat: Concat) -> str:
-    """The group a phrase belongs to: its id prefix, or a value from its metadata.
-
-    Raises:
-        ValueError: If grouping by a `meta` key the phrase does not have.
-    """
-    if concat.group_by == "id_prefix":
-        return phrase.record_id.rsplit(concat.separator, 1)[0]
-    if concat.group_by not in phrase.meta:
-        raise ValueError(f"phrase {phrase.key} has no meta {concat.group_by!r} to group by")
-    return str(phrase.meta[concat.group_by])
-
-
-def _join(parts: list[tuple[float, Phrase]], group: str, sample_rate: int) -> Phrase:
-    """Join phrases into one, each after its silence, shifting their speech spans."""
-    pieces: list[Samples] = []
-    speech: list[ops.Span] = []
-    frames = 0
-    for gap, phrase in parts:
-        silence = ops.zeros(int(gap * sample_rate))
-        frames += silence.shape[0]
-        shift = frames / sample_rate
-        speech.extend((start + shift, end + shift) for start, end in phrase.speech)
-        pieces.extend([silence, phrase.samples])
-        frames += phrase.samples.shape[0]
-    phrases = [phrase for _, phrase in parts]
-    references = [phrase.reference for phrase in phrases if phrase.reference]
-    first = phrases[0]
-    aligned = all(phrase.truth == "alignment" for phrase in phrases)
-    return Phrase(
-        key=f"{first.key}+{len(phrases)}",
-        record_id=first.record_id,
-        language=first.language,
-        reference=" ".join(references) if references else None,
-        samples=np.concatenate(pieces).astype(np.float32),
-        speech=speech,
-        truth="alignment" if aligned else "utterance_bounds",
-        sample_rate=sample_rate,
-        meta={**first.meta, "concat_parts": len(phrases), "concat_group": group},
-    )
+    return sum(gap + phrase.clip.seconds for gap, phrase in parts)
 
 
 def _load_pool(background: Background, sample_rate: int) -> Pool:
@@ -335,27 +337,24 @@ def _load_pool(background: Background, sample_rate: int) -> Pool:
 
 @dataclass(frozen=True)
 class _Build:
-    """What stays the same for a whole build: the recipe, the backgrounds, their use.
+    """What stays the same for a whole build: the recipe and its decoded backgrounds.
 
     Attributes:
         recipe: The recipe being built.
-        pools: Decoded background clips by background name.
-        used: How many clips took each background clip, by its id, for `sources.json`.
+        pools: Decoded background clips by background name; they count their own use.
     """
 
     recipe: Recipe
     pools: Mapping[str, Pool]
-    used: Counter[str]
 
     def clips(self, condition: Condition, phrases: list[Phrase]) -> list[_Made]:
         """Make every clip of one condition: one per phrase, or `count` without speech."""
-        rate = self.recipe.sample_rate
         starts: list[tuple[Phrase | None, Clip | None]]
         if condition.speech == "none":
             assert condition.count is not None  # guaranteed by Condition's validator
             starts = [(None, None)] * condition.count
         else:
-            starts = [(phrase, Clip(phrase.samples, rate, phrase.speech)) for phrase in phrases]
+            starts = [(phrase, phrase.clip) for phrase in phrases]
         salt = zlib.crc32(condition.name.encode())
         made = []
         for number, (phrase, clip) in enumerate(starts):
@@ -402,10 +401,8 @@ class _Build:
             return ops.zeros(frames)
         if fill == "floor":
             return ops.noise_floor(frames, floor_dbfs, draw.rng)
-        clips = self.pools[fill].clips
-        background_id, samples = clips[int(draw.rng.integers(len(clips)))]
+        background_id, samples = self.pools[fill].pick(draw.rng)
         draw.note("background_id", background_id)
-        self.used[background_id] += 1
         return ops.excerpt(samples, frames, draw.rng) if frames else ops.zeros(0)
 
 
@@ -448,22 +445,20 @@ def _write_manifest(path: Path, records: list[SampleRecord]) -> None:
             out.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _write_sources(
-    path: Path, recipe: Recipe, pools: Mapping[str, Pool], used: Counter[str]
-) -> None:
+def _write_sources(path: Path, run: _Build) -> None:
     """Write every input with its full config (dataset, revision) and license."""
+    recipe = run.recipe
     inputs: list[dict[str, Any]] = [
         {"role": "speech", "source": speech.source, "take": speech.take} for speech in recipe.speech
     ]
     for name, background in recipe.backgrounds.items():
-        ids = {clip_id for clip_id, _ in pools[name].clips}
-        taken = sum(count for clip_id, count in used.items() if clip_id in ids)
+        pool = run.pools[name]
         inputs.append(
             {
                 "role": f"background:{name}",
                 "source": background.source,
-                "clips_in_pool_by_license": dict(sorted(pools[name].licenses.items())),
-                "clips_used": taken,
+                "clips_in_pool_by_license": dict(sorted(pool.licenses.items())),
+                "clips_used": pool.used.total(),
             }
         )
     document = {"recipe": recipe.name, "seed": recipe.seed, "inputs": inputs}

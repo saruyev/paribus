@@ -152,3 +152,26 @@ def test_unknown_codec_is_an_error() -> None:
     """Only the codecs the recipe allows are accepted."""
     with pytest.raises(ValueError, match="unknown codec 'mp3'"):
         ops.codec(_speech(), "mp3")
+
+
+def test_join_plays_both_clips_and_shifts_the_second_speech() -> None:
+    """The second clip's speech moves by the first clip plus the silence; the first stays."""
+    first = Clip(_tone(seconds=1.0), _RATE, [(0.25, 0.75)])
+    second = Clip(_tone(seconds=0.5), _RATE, [(0.0, 0.5)])
+
+    joined = ops.join(first, ops.zeros(_RATE // 4), second)
+
+    assert joined.seconds == 1.75
+    assert joined.speech == [(0.25, 0.75), (1.25, 1.75)]
+
+
+def test_join_refuses_clips_of_different_rates() -> None:
+    """Joining 16 kHz and 8 kHz audio would play one of them at the wrong speed."""
+    with pytest.raises(ValueError, match="16000 Hz and 8000 Hz"):
+        ops.join(_speech(), ops.zeros(0), ops.resample(_speech(), 8000))
+
+
+def test_bounds_of_fixed_values_and_ranges() -> None:
+    """A fixed value is a range of one point."""
+    assert ops.bounds(3.0) == (3.0, 3.0)
+    assert ops.bounds((1.0, 2.0)) == (1.0, 2.0)
