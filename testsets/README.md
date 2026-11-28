@@ -160,6 +160,89 @@ names `zero` and `floor` are reserved for the built-in fills.
 | A new corruption mix (your codec + your call-center noise at 5 dB) | The recipe: a new condition. No code. |
 | A new kind of corruption (reverb, dropouts, clipping) | Three places: a function in `ops.py`, a model in `recipe.py` (added to `_OPS` and `Op`), and a branch in `_Build.apply` in `build.py`. Add a test in `tests/unit/testsets/`. |
 
+### Example: adding packet loss
+
+Vasya's ASR runs on VoIP calls, and users complain about calls with a bad network.
+Packet loss is not among the operations, so he adds a `dropout` op that silences random
+20 ms chunks, the way a lost packet does.
+
+**1. The operation, in `ops.py`.** It is a pure function: it takes a clip and an `rng`, and
+it returns a new clip. Speech spans stay as they are, because the speaker did talk there.
+The model just did not hear all of it.
+
+```python
+def dropout(clip: Clip, rate: float, chunk_ms: float, rng: np.random.Generator) -> Clip:
+    """Silence random `chunk_ms` chunks, each with probability `rate`, like lost packets."""
+    chunk = max(1, int(clip.sample_rate * chunk_ms / 1000))
+    lost = rng.random(-(-clip.frames // chunk)) < rate  # one draw per chunk
+    keep = np.repeat(~lost, chunk)[: clip.frames]
+    return replace(clip, samples=(clip.samples * keep).astype(np.float32))
+```
+
+**2. Its settings, in `recipe.py`.** One model, plus one entry in `_OPS` and one in the
+`Op` union. Validation lives here, so `rate: 1.5` fails when the recipe is loaded.
+
+```python
+class Dropout(_Op):
+    """Silence random chunks of `chunk_ms`, each lost with probability `rate`."""
+
+    op: Literal["dropout"] = "dropout"
+    rate: Range
+    chunk_ms: float = Field(default=20.0, gt=0)
+
+    shorthand: ClassVar[str | None] = "rate"
+
+    @model_validator(mode="after")
+    def _rate_is_a_fraction(self) -> Self:
+        """Reject a loss rate outside [0, 1]."""
+        low, high = self.rate if isinstance(self.rate, tuple) else (self.rate, self.rate)
+        if not 0 <= low <= high <= 1:
+            raise ValueError(f"dropout rate must be within [0, 1], got {self.rate}")
+        return self
+
+
+_OPS = {..., "dropout": Dropout}
+type Op = Annotated[Mix | Pad | ... | Gain | Dropout, Field(discriminator="op")]
+```
+
+**3. Wiring, in `_Build.apply` in `build.py`** (and `Dropout` added to its imports from `testsets.recipe`). `draw.value` draws the setting and writes it
+to `meta`, so later every clip says how much loss it got.
+
+```python
+if isinstance(op, Dropout):
+    loss = draw.value("dropout_rate", op.rate, 3)  # `rate` is taken: it is the sample rate
+    return ops.dropout(clip, loss, op.chunk_ms, draw.rng)
+```
+
+**4. A test, in `tests/unit/testsets/test_ops.py`.**
+
+```python
+def test_dropout_silences_about_rate_of_the_chunks() -> None:
+    """With rate 0.3, about 30% of the 20 ms chunks become zeros; speech spans stay."""
+    clip = _speech(10.0)
+
+    out = ops.dropout(clip, 0.3, 20, np.random.default_rng(0))
+
+    chunks = out.samples.reshape(-1, 320)  # 20 ms at 16 kHz
+    assert np.mean(np.all(chunks == 0, axis=1)) == pytest.approx(0.3, abs=0.05)
+    assert out.speech == clip.speech
+```
+
+**5. Use it in a recipe.** He puts it on top of the telephone chain, since that is where
+loss happens in real life:
+
+```yaml
+  - name: voip_loss
+    ops:
+      - resample: 8000
+      - codec: {name: opus, bitrate: 12000}
+      - dropout: [0.02, 0.15]     # shorthand for {rate: [0.02, 0.15]}
+```
+
+After a rebuild, the `voip_loss` clips get `meta.dropout_rate`, and no other condition
+changes by a single byte. Comparing `voip_loss` with plain `opus12k`, on the same phrases,
+shows exactly what the loss costs his ASR.
+
 ## Shipped recipes
 
 - `recipes/t0-components.yaml`: the set used to choose the VAD, tagger, LID and local ASR.
