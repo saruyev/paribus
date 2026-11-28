@@ -82,6 +82,7 @@ def test_hub_is_asked_for_the_pinned_revision_as_a_stream(
     assert hub["call"] == {
         "path": _DATASET,
         "name": "clean",
+        "data_dir": None,
         "split": "test",
         "revision": _REVISION,
         "streaming": True,
@@ -237,3 +238,14 @@ def test_speech_segments_of_the_wrong_shape_are_reported(
         list(_source(tmp_path, speech_segments_column="words").records())
 
     assert error.value.issues[0].message == "column 'words' must hold spans with start and end"
+
+
+def test_a_data_dir_is_read_and_cached_on_its_own(tmp_path: Path, hub: dict[str, Any]) -> None:
+    """A folder of a dataset is passed to the Hub and gets its own cache folder."""
+    hub["rows"] = {"audio": _wav(tmp_path, "x")}
+
+    (record,) = _source(tmp_path, data_dir="ru_ru").records()
+
+    assert hub["call"]["data_dir"] == "ru_ru"
+    cache = tmp_path / "cache" / _DATASET / _REVISION / "default" / "ru_ru" / "test"
+    assert record.audio == cache.resolve() / "000000.wav"

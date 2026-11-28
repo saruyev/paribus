@@ -303,6 +303,9 @@ class HFConfig(SourceConfig):
         revision: Commit sha or tag to read. Required, because a dataset can change under
             a branch name, and then two runs would quietly read different data.
         subset: The dataset's configuration (`name` in `datasets.load_dataset`), if any.
+        data_dir: A folder inside the dataset to read, for datasets laid out as folders
+            rather than configurations, such as the parquet conversion of a script
+            dataset (`google/fleurs` at `refs/convert/parquet` keeps `ru_ru/test/...`).
         split: Split to read, e.g. `test`.
         audio_column: Column holding the audio.
         text_column: Column holding a transcript; needed when `transcripts` is not `none`.
@@ -322,6 +325,7 @@ class HFConfig(SourceConfig):
     dataset: str = Field(min_length=1)
     revision: str = Field(min_length=1)
     subset: str | None = None
+    data_dir: str | None = None
     split: str = Field(min_length=1)
     audio_column: str = "audio"
     text_column: str | None = None

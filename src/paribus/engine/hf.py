@@ -32,8 +32,8 @@ class HFDatasetSource:
     """Reads one split of a Hub dataset at a pinned revision.
 
     Audio files are cached under
-    `<cache_dir>/<dataset>/<revision>/<subset>/<split>/<row index>.<ext>`; the extension
-    comes from the file name the dataset stores with the audio. Ids come from
+    `<cache_dir>/<dataset>/<revision>/<subset>[/<data_dir>]/<split>/<row index>.<ext>`;
+    the extension comes from the file name the dataset stores with the audio. Ids come from
     `id_column`, or are `<split>/<row index>`. The source is named after the dataset
     unless the config names it.
     """
@@ -43,13 +43,15 @@ class HFDatasetSource:
         self.config = config
         self.name = config.name or config.dataset
         self.license = config.license
-        self._cache = (
+        cache = (
             (config.cache_dir or DEFAULT_CACHE_DIR)
             / config.dataset
             / _safe(config.revision)
             / _safe(config.subset or "default")
-            / config.split
-        ).resolve()
+        )
+        if config.data_dir is not None:  # two folders of one dataset must not share a cache
+            cache = cache / _safe(config.data_dir)
+        self._cache = (cache / config.split).resolve()
 
     def records(self) -> Iterator[SampleRecord]:
         """Read and cache every row (up to `limit`), then yield the records in row order.
@@ -91,6 +93,7 @@ class HFDatasetSource:
         stream = datasets.load_dataset(
             config.dataset,
             name=config.subset,
+            data_dir=config.data_dir,
             split=config.split,
             revision=config.revision,
             streaming=True,
