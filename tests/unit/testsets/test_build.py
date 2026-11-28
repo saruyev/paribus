@@ -155,7 +155,7 @@ class _MuteStart(Operation):
         """Zero the drawn number of leading frames, recording the length in `meta`."""
         frames = int(ctx.value("muted", self.seconds, 3) * clip.sample_rate)
         samples = clip.samples.copy()
-        samples[:frames] = 0
+        samples[:, :frames] = 0
         return replace(clip, samples=samples)
 
 
@@ -400,4 +400,63 @@ def test_concat_needs_one_sample_rate(tmp_path: Path) -> None:
 
     fixed = recipe.model_copy(update={"sample_rate": 16000})
     (row,) = _rows(build(fixed, tmp_path / "out"))
+    assert row["meta"]["concat_parts"] == 2
+
+
+def _write_stereo(path: Path, seconds: float) -> None:
+    """Write a stereo 16-bit wav: 300 Hz left, 600 Hz right, like two sides of a call."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    t = np.arange(int(_RATE * seconds)) / _RATE
+    left, right = (0.1 * np.sin(2 * np.pi * hz * t) for hz in (300, 600))
+    pcm = np.round(np.stack([left, right], axis=1) * 32767).astype("<i2")
+    with wave.open(str(path), "wb") as out:
+        out.setnchannels(2)
+        out.setsampwidth(2)
+        out.setframerate(_RATE)
+        out.writeframes(pcm.tobytes())
+
+
+def _channels_of(path: Path) -> int:
+    """Channel count of a wav file."""
+    with wave.open(str(path)) as clip:
+        return clip.getnchannels()
+
+
+def test_stereo_stays_stereo_unless_the_recipe_says_mono(tmp_path: Path) -> None:
+    """`keep` copies a stereo clean file as is and keeps both channels under a mix."""
+    _write_stereo(tmp_path / "speech" / "call.wav", 2.0)
+    _write_tone(tmp_path / "music" / "m0.wav", 3.0, 1000)
+    conditions = [
+        {"name": "clean"},
+        {"name": "music", "ops": [{"mix": {"background": "music", "snr_db": 10}}]},
+    ]
+    keep = _recipe(tmp_path, *conditions, take=1, sample_rate="native")
+    mono = keep.model_copy(update={"channels": "mono", "name": "mono"})
+
+    rows = {row["meta"]["condition"]: row for row in _rows(build(keep, tmp_path / "out"))}
+    out = tmp_path / "out" / "tiny"
+    assert (out / rows["clean"]["audio"]).read_bytes() == (
+        tmp_path / "speech" / "call.wav"
+    ).read_bytes()
+    assert _channels_of(out / rows["music"]["audio"]) == 2
+
+    for row in _rows(build(mono, tmp_path / "out")):
+        assert _channels_of(tmp_path / "out" / "mono" / row["audio"]) == 1
+
+
+def test_concat_needs_one_channel_count(tmp_path: Path) -> None:
+    """Under `keep`, a mono and a stereo phrase cannot be joined; `mono` joins them."""
+    _write_tone(tmp_path / "speech" / "b-1-0.wav", 1.0, 300)
+    _write_stereo(tmp_path / "speech" / "b-1-1.wav", 1.0)
+    _write_tone(tmp_path / "music" / "m0.wav", 1.0, 1000)
+    recipe = _recipe(tmp_path, take=1)
+    speech = recipe.speech[0].model_copy(
+        update={"duration": None, "concat": Concat(seconds=(1.5, 3), gap=0.5)}
+    )
+    recipe = recipe.model_copy(update={"speech": [speech]})
+
+    with pytest.raises(ValueError, match=r"different channel counts \(1, 2\)"):
+        build(recipe, tmp_path / "out")
+
+    (row,) = _rows(build(recipe.model_copy(update={"channels": "mono"}), tmp_path / "out"))
     assert row["meta"]["concat_parts"] == 2

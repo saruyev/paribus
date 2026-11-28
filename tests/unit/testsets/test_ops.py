@@ -17,7 +17,7 @@ def _tone(seconds: float = 1.0, hz: float = 440, level: float = 0.1) -> np.ndarr
 
 def _speech(seconds: float = 1.0) -> Clip:
     """A clip that is speech from start to end."""
-    return Clip(_tone(seconds), _RATE, [(0.0, seconds)])
+    return Clip(_tone(seconds)[None, :], _RATE, [(0.0, seconds)])
 
 
 def _rms(samples: np.ndarray) -> float:
@@ -51,14 +51,14 @@ def test_mix_measures_speech_only_inside_speech_spans() -> None:
 
     mixed = ops.mix(padded, background, 0.0)
 
-    speech = padded.samples[3 * _RATE :]
-    added = (mixed.samples - padded.samples)[3 * _RATE :]
+    speech = padded.samples[:, 3 * _RATE :]
+    added = (mixed.samples - padded.samples)[:, 3 * _RATE :]
     assert _rms(added) == pytest.approx(_rms(speech), rel=0.05)
 
 
 def test_mix_scales_down_instead_of_clipping() -> None:
     """A loud mix is scaled as a whole, so the SNR survives and nothing clips."""
-    clip = Clip(_tone(level=0.95), _RATE, [(0.0, 1.0)])
+    clip = Clip(_tone(level=0.95)[None, :], _RATE, [(0.0, 1.0)])
     background = _tone(hz=1000, level=0.95)
 
     mixed = ops.mix(clip, background, 0.0)
@@ -69,7 +69,7 @@ def test_mix_scales_down_instead_of_clipping() -> None:
 def test_mix_needs_speech_and_a_background_of_the_same_length() -> None:
     """Mistakes in the builder fail loudly instead of producing a wrong SNR."""
     with pytest.raises(ValueError, match="needs speech"):
-        ops.mix(Clip(_tone(), _RATE, []), _tone(), 0.0)
+        ops.mix(Clip(_tone()[None, :], _RATE, []), _tone(), 0.0)
     with pytest.raises(ValueError, match="frames"):
         ops.mix(_speech(), _tone(seconds=0.5), 0.0)
     with pytest.raises(ValueError, match="silent"):
@@ -123,12 +123,12 @@ def test_resample_keeps_duration_and_speech() -> None:
 
     assert clip.sample_rate == 8000 and clip.frames == 8000
     assert clip.speech == [(0.0, 1.0)]
-    assert _peak_hz(clip.samples, 8000) == pytest.approx(440, abs=2)
+    assert _peak_hz(clip.samples[0], 8000) == pytest.approx(440, abs=2)
 
 
 def test_gain_changes_level_and_clips_at_full_scale() -> None:
     """-6 dB halves the amplitude; +20 dB clips instead of being scaled back."""
-    clip = Clip(_tone(level=0.5), _RATE, [(0.0, 1.0)])
+    clip = Clip(_tone(level=0.5)[None, :], _RATE, [(0.0, 1.0)])
     quieter = ops.gain(clip, -6.0206)
     louder = ops.gain(clip, 20.0)
 
@@ -145,7 +145,7 @@ def test_codec_round_trip_keeps_length_rate_and_pitch(name: str, bitrate: int | 
 
     assert coded.sample_rate == _RATE and coded.frames == clip.frames
     assert not np.array_equal(coded.samples, clip.samples)
-    assert _peak_hz(coded.samples, _RATE) == pytest.approx(440, abs=2)
+    assert _peak_hz(coded.samples[0], _RATE) == pytest.approx(440, abs=2)
 
 
 def test_unknown_codec_is_an_error() -> None:
@@ -156,8 +156,8 @@ def test_unknown_codec_is_an_error() -> None:
 
 def test_join_plays_both_clips_and_shifts_the_second_speech() -> None:
     """The second clip's speech moves by the first clip plus the silence; the first stays."""
-    first = Clip(_tone(seconds=1.0), _RATE, [(0.25, 0.75)])
-    second = Clip(_tone(seconds=0.5), _RATE, [(0.0, 0.5)])
+    first = Clip(_tone(seconds=1.0)[None, :], _RATE, [(0.25, 0.75)])
+    second = Clip(_tone(seconds=0.5)[None, :], _RATE, [(0.0, 0.5)])
 
     joined = ops.join(first, ops.zeros(_RATE // 4), second)
 
@@ -175,3 +175,58 @@ def test_bounds_of_fixed_values_and_ranges() -> None:
     """A fixed value is a range of one point."""
     assert ops.bounds(3.0) == (3.0, 3.0)
     assert ops.bounds((1.0, 2.0)) == (1.0, 2.0)
+
+
+def _stereo(seconds: float = 1.0) -> Clip:
+    """A stereo clip: 440 Hz on the left, 880 Hz on the right, speech throughout."""
+    samples = np.stack([_tone(seconds, 440), _tone(seconds, 880)])
+    return Clip(samples, _RATE, [(0.0, seconds)])
+
+
+def test_a_clip_must_be_channels_by_frames() -> None:
+    """Forgetting the channel axis fails at once instead of mixing up frames and channels."""
+    with pytest.raises(ValueError, match=r"\(channels, frames\)"):
+        Clip(_tone(), _RATE, [])
+
+
+def test_stereo_keeps_its_channels_through_every_operation() -> None:
+    """Mix, pad, resample, gain and both codec kinds keep the two channels apart."""
+    clip = _stereo()
+    background = ops.noise_floor(clip.frames, -30, np.random.default_rng(0))
+    clip = ops.mix(clip, background, 20.0)
+    clip = ops.pad(clip, ops.zeros(_RATE // 2), ops.zeros(0))
+
+    for out, rate in [
+        (ops.resample(clip, 8000), 8000),
+        (ops.gain(clip, -6.0), _RATE),
+        (ops.codec(clip, "pcm_mulaw"), _RATE),
+        (ops.codec(clip, "opus", 32000), _RATE),
+    ]:
+        assert out.channels == 2 and out.speech == [(0.5, 1.5)]
+        speech = out.samples[:, rate // 2 :]
+        assert _peak_hz(speech[0], rate) == pytest.approx(440, abs=2)
+        assert _peak_hz(speech[1], rate) == pytest.approx(880, abs=2)
+
+
+def test_mix_puts_the_same_background_on_every_channel() -> None:
+    """What is added is the same on both channels, at the SNR of both channels together."""
+    clip = _stereo()
+    background = ops.noise_floor(clip.frames, -20, np.random.default_rng(0))
+
+    added = ops.mix(clip, background, 10.0).samples - clip.samples
+
+    assert np.allclose(added[0], added[1])
+    assert 20 * np.log10(_rms(clip.samples) / _rms(added)) == pytest.approx(10.0, abs=0.01)
+
+
+def test_join_refuses_clips_of_different_channel_counts() -> None:
+    """Joining mono to stereo would have to invent or drop a channel."""
+    with pytest.raises(ValueError, match="1 and 2 channels"):
+        ops.join(_speech(), ops.zeros(0), _stereo())
+
+
+def test_generate_puts_the_fill_on_every_channel() -> None:
+    """A generated stereo clip has the fill on both channels and no speech."""
+    clip = ops.generate(ops.noise_floor(_RATE, -40, np.random.default_rng(0)), _RATE, 2)
+
+    assert clip.channels == 2 and np.array_equal(clip.samples[0], clip.samples[1])

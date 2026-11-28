@@ -276,13 +276,15 @@ class Generate(Operation):
     """Make a clip without speech: `seconds` of `fill` (as in `Pad`).
 
     `sample_rate` is the new clip's rate; without it, the recipe's rate, or 16000 when
-    the recipe keeps each file's own rate.
+    the recipe keeps each file's own rate. `channels` is how many channels it has, all
+    with the same fill.
     """
 
     fill: str
     seconds: Range
     floor_dbfs: float = -60.0
     sample_rate: int | None = Field(default=None, gt=0)
+    channels: int = Field(default=1, ge=1)
 
     shorthand: ClassVar[str | None] = "fill"
     starts_clip: ClassVar[bool] = True
@@ -291,7 +293,8 @@ class Generate(Operation):
         """Draw the length and fill it, at the recipe's sample rate."""
         rate = self.sample_rate or ctx.sample_rate
         frames = int(ctx.value("seconds", self.seconds, 3) * rate)
-        return ops.generate(ctx.fill(self.fill, frames, self.floor_dbfs, rate), rate)
+        fill = ctx.fill(self.fill, frames, self.floor_dbfs, rate)
+        return ops.generate(fill, rate, self.channels)
 
     def backgrounds(self) -> list[str]:
         """The fill's background, if it is one."""
@@ -420,6 +423,8 @@ class Recipe(_Model):
         sample_rate: `native` keeps every file at its own rate, so only a `resample`
             operation changes it; a number resamples every phrase and background to it
             when they are loaded.
+        channels: `keep` keeps every channel of a file (a stereo call stays stereo);
+            `mono` averages them. Backgrounds are always mono and go on every channel.
         speech: Sources of the phrases that every speech condition corrupts.
         backgrounds: Background pools by name, referred to by `mix`, `pad` and `generate`.
         conditions: The corruptions; names must be unique.
@@ -432,6 +437,7 @@ class Recipe(_Model):
     seed: int
     plugins: list[Annotated[str, Field(pattern=_MODULE)]] = Field(default_factory=list)
     sample_rate: Annotated[int, Field(gt=0)] | Literal["native"] = "native"
+    channels: Literal["keep", "mono"] = "keep"
     speech: list[SpeechInput] = Field(min_length=1)
     backgrounds: dict[str, Background] = Field(default_factory=dict)
     conditions: list[Condition] = Field(min_length=1)

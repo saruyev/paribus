@@ -70,8 +70,8 @@ class Pool:
     """Background clips of one recipe background, decoded once.
 
     Attributes:
-        clips: (clip id, clip) pairs, at the recipe's rate or, if it is `native`, at
-            each file's own rate.
+        clips: (clip id, clip) pairs, mono, at the recipe's rate or, if it is `native`,
+            at each file's own rate.
         licenses: Number of clips in the pool under each license, for `sources.json`.
         used: How many built clips took a stretch of this pool, for `sources.json`.
     """
@@ -90,10 +90,10 @@ class Pool:
         clip_id, clip = self.clips[int(rng.integers(len(self.clips)))]
         self.used[clip_id] += 1
         if clip.sample_rate == sample_rate:
-            return clip_id, clip.samples
+            return clip_id, clip.samples[0]
         key = (clip_id, sample_rate)
         if key not in self._resampled:
-            self._resampled[key] = ops.resample(clip, sample_rate).samples
+            self._resampled[key] = ops.resample(clip, sample_rate).samples[0]
         return clip_id, self._resampled[key]
 
 
@@ -193,9 +193,9 @@ def _load_phrases(recipe: Recipe) -> list[Phrase]:
     phrases: list[Phrase] = []
     for number, speech in enumerate(recipe.speech):
         rng = np.random.default_rng([recipe.seed, number])
-        candidates = _candidates(speech, _fixed_rate(recipe))
+        candidates = _candidates(speech, _fixed_rate(recipe), recipe.channels == "mono")
         if speech.concat is not None:
-            _check_one_rate(candidates, number)
+            _check_joinable(candidates, number)
             packer = _Packer(speech.concat, np.random.default_rng([recipe.seed, number, 1]))
             candidates = packer.pack(candidates)
         if len(candidates) < speech.take:
@@ -212,22 +212,27 @@ def _load_phrases(recipe: Recipe) -> list[Phrase]:
     return phrases
 
 
-def _check_one_rate(phrases: list[Phrase], number: int) -> None:
-    """Require one sample rate across the phrases that `concat` joins.
+def _check_joinable(phrases: list[Phrase], number: int) -> None:
+    """Require one sample rate and one channel count across the phrases `concat` joins.
 
-    With a fixed recipe rate this always holds. With `native` the files must already
-    agree, because joining 8 kHz and 16 kHz audio would need a silent resample.
+    With a fixed recipe rate and `channels: mono` this always holds. Otherwise the files
+    must already agree, because joining 8 kHz and 16 kHz audio, or mono and stereo, would
+    need a silent conversion.
 
     Raises:
-        ValueError: If the phrases have more than one rate, listing them.
+        ValueError: If the phrases differ in rate or channels, listing what was found.
     """
-    rates = sorted({phrase.clip.sample_rate for phrase in phrases})
-    if len(rates) > 1:
-        listed = ", ".join(str(rate) for rate in rates)
-        raise ValueError(
-            f"speech input {number} joins phrases with concat, but they have different "
-            f"sample rates ({listed} Hz); set the recipe's sample_rate to one rate"
-        )
+    for what, unit, values in [
+        ("sample rates", " Hz", {phrase.clip.sample_rate for phrase in phrases}),
+        ("channel counts", "", {phrase.clip.channels for phrase in phrases}),
+    ]:
+        if len(values) > 1:
+            listed = ", ".join(str(value) for value in sorted(values))
+            raise ValueError(
+                f"speech input {number} joins phrases with concat, but they have different "
+                f"{what} ({listed}{unit}); set the recipe's sample_rate to one rate "
+                "and channels to mono"
+            )
 
 
 def _fixed_rate(recipe: Recipe) -> int | None:
@@ -235,19 +240,21 @@ def _fixed_rate(recipe: Recipe) -> int | None:
     return None if recipe.sample_rate == "native" else recipe.sample_rate
 
 
-def _candidates(speech: SpeechInput, sample_rate: int | None) -> list[Phrase]:
+def _candidates(speech: SpeechInput, sample_rate: int | None, mono: bool) -> list[Phrase]:
     """Decode an input's records and keep those within its duration filter.
 
-    `sample_rate` None keeps every file at its own rate.
+    `sample_rate` None keeps every file at its own rate; `mono` averages its channels.
     """
     source = build_source(speech.source)
     candidates = []
     for record in source.records():
         spans = record.speech_segments
         audio = load_audio(record, sample_rate)
-        clip = Clip(audio.mono(), audio.sample_rate, list(spans or []))
-        # Unchanged means: its own rate, every channel of the file (mono stays mono).
-        unchanged = sample_rate is None and record.channel is None and audio.samples.shape[0] == 1
+        downmix = mono and audio.samples.shape[0] > 1
+        samples = audio.mono()[None, :] if downmix else audio.samples
+        clip = Clip(samples, audio.sample_rate, list(spans or []))
+        # Unchanged means: the whole file at its own rate, with all its channels.
+        unchanged = sample_rate is None and record.channel is None and not downmix
         if speech.duration is not None and not (
             speech.duration[0] <= clip.seconds <= speech.duration[1]
         ):
@@ -383,7 +390,8 @@ def _load_pool(background: Background, sample_rate: int | None) -> Pool:
         if background.licenses is not None and license_name not in background.licenses:
             continue
         audio = load_audio(record, sample_rate)
-        clips.append((f"{source.name}/{record.id}", Clip(audio.mono(), audio.sample_rate, [])))
+        clip = Clip(audio.mono()[None, :], audio.sample_rate, [])
+        clips.append((f"{source.name}/{record.id}", clip))
         licenses[license_name] += 1
     if not clips:
         raise ValueError(f"background source {source.name!r} has no clip with an allowed license")
@@ -449,11 +457,12 @@ def _write_clip(root: Path, made: _Made) -> SampleRecord:
 
 
 def _write_wav(path: Path, clip: Clip) -> None:
-    """Write a clip as mono 16-bit PCM, the format every model and tool reads."""
+    """Write a clip as 16-bit PCM with all its channels, the format every tool reads."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    pcm = np.round(np.clip(clip.samples, -1.0, 1.0) * 32767).astype("<i2")
+    # wav interleaves channels frame by frame: (frames, channels) in memory order.
+    pcm = np.round(np.clip(clip.samples.T, -1.0, 1.0) * 32767).astype("<i2")
     with wave.open(str(path), "wb") as out:
-        out.setnchannels(1)
+        out.setnchannels(clip.channels)
         out.setsampwidth(2)
         out.setframerate(clip.sample_rate)
         out.writeframes(pcm.tobytes())
