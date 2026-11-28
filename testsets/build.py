@@ -130,6 +130,10 @@ class _Context:
             name = f"{key}_{number}"
         self.meta[name] = value
 
+    def fork(self) -> "_Context":
+        """A context for one piece after a split: the same generator, its own `meta`."""
+        return replace(self, meta=dict(self.meta))
+
     def fill(self, fill: str, frames: int, floor_dbfs: float, sample_rate: int) -> Samples:
         """Make `frames` of digital zero, a noise floor, or a random background stretch."""
         if fill == "zero":
@@ -151,6 +155,7 @@ class _Made:
     clip: Clip
     meta: dict[str, MetaValue]
     copy: Path | None = None
+    part: int | None = None  # the piece's number, in a condition that splits
 
 
 def build(recipe: Recipe, out_dir: Path, force: bool = False) -> Path:
@@ -420,22 +425,50 @@ class _Build:
             starts = [(phrase, phrase.clip) for phrase in phrases]
         salt = zlib.crc32(condition.name.encode())
         made_rate = _fixed_rate(self.recipe) or _DEFAULT_RATE
+        grouped = any(op.splits for op in condition.ops)
         made = []
         for number, (phrase, clip) in enumerate(starts):
             rng = np.random.default_rng([self.recipe.seed, salt, number])
             ctx = _Context(rng, {"condition": condition.name}, made_rate, self.pools)
-            for op in condition.ops:
-                clip = op.make(ctx) if clip is None else op.apply(clip, ctx)
-            assert clip is not None  # a no-speech condition starts with a clip-making op
             copy = phrase.origin if phrase is not None and not condition.ops else None
-            made.append(_Made(condition, number, phrase, clip, ctx.meta, copy))
+            for part, (piece, piece_ctx) in enumerate(self.run(condition, clip, ctx)):
+                piece_part = part if grouped else None
+                made.append(
+                    _Made(condition, number, phrase, piece, piece_ctx.meta, copy, piece_part)
+                )
         return made
+
+    def run(
+        self, condition: Condition, clip: Clip | None, ctx: _Context
+    ) -> list[tuple[Clip, _Context]]:
+        """Run a condition's operations on one starting clip, giving the pieces it ends as.
+
+        Without `split` that is one clip. After a split, each piece goes on with its own
+        copy of the context, so what later operations draw lands in that piece's `meta`.
+        """
+        remaining = list(condition.ops)
+        if clip is None:  # a no-speech condition: the validator put a clip-maker first
+            clip = remaining.pop(0).make(ctx)
+        pieces = [(clip, ctx)]
+        for op in remaining:
+            expanded = []
+            for piece, piece_ctx in pieces:
+                outs = op.expand(piece, piece_ctx)
+                forked = len(outs) > 1
+                expanded += [(out, piece_ctx.fork() if forked else piece_ctx) for out in outs]
+            pieces = expanded
+        return pieces
 
 
 def _write_clip(root: Path, made: _Made) -> SampleRecord:
     """Write one clip as 16-bit wav and return its record, with the audio path relative."""
     phrase, meta = made.phrase, made.meta
     name = phrase.key if phrase is not None else f"{made.number:04d}"
+    group_id = offset = None
+    if made.part is not None:  # a piece: `<clip>/<part>`, grouped under the whole clip
+        group_id, offset = f"{made.condition.name}/{name}", round(made.clip.offset, 4)
+        name = f"{name}/{made.part:03d}"
+        meta = {**meta, "split_part": made.part}
     folder = Path("audio") / made.condition.name
     if made.copy is not None:  # the original file, untouched
         relative = folder / f"{name}{made.copy.suffix.lower()}"
@@ -452,6 +485,8 @@ def _write_clip(root: Path, made: _Made) -> SampleRecord:
         language=phrase.language if phrase else None,
         reference=phrase.reference if phrase else None,
         speech_segments=[(round(start, 4), round(end, 4)) for start, end in made.clip.speech],
+        group_id=group_id,
+        offset=offset,
         meta=meta,
     )
 

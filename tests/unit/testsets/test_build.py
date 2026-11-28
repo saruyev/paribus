@@ -460,3 +460,32 @@ def test_concat_needs_one_channel_count(tmp_path: Path) -> None:
 
     (row,) = _rows(build(recipe.model_copy(update={"channels": "mono"}), tmp_path / "out"))
     assert row["meta"]["concat_parts"] == 2
+
+
+def test_split_writes_pieces_of_a_group(inputs: Path, tmp_path: Path) -> None:
+    """Each piece is a record with `group_id`, `offset`, local speech and its own meta."""
+    condition = {"name": "cut", "ops": [{"split": 0.5}, {"gain": [-6, 0]}]}
+
+    rows = _rows(build(_recipe(inputs, condition, take=1), tmp_path / "out"))
+
+    assert len(rows) > 1
+    assert {row["group_id"] for row in rows} == {"cut/" + rows[0]["meta"]["source_id"]}
+    assert [row["offset"] for row in rows] == [0.5 * part for part in range(len(rows))]
+    assert [row["meta"]["split_part"] for row in rows] == list(range(len(rows)))
+    assert all("gain_db_2" not in row["meta"] for row in rows)  # each piece has its own meta
+    assert all(end <= 0.5 for row in rows for _, end in row["speech_segments"])
+
+
+def test_resample_before_or_after_split_gives_the_same_pieces(inputs: Path, tmp_path: Path) -> None:
+    """The two orders differ in the samples only, so they can be compared piece by piece."""
+    whole = {"name": "whole", "ops": [{"resample": 8000}, {"split": 0.5}]}
+    pieces = {"name": "pieces", "ops": [{"split": 0.5}, {"resample": 8000}]}
+
+    rows = _rows(build(_recipe(inputs, whole, pieces), tmp_path / "out"))
+
+    by_order: dict[str, list[tuple[float, list[Any]]]] = {"whole": [], "pieces": []}
+    for row in rows:
+        by_order[row["meta"]["condition"]].append((row["offset"], row["speech_segments"]))
+    assert by_order["whole"] == by_order["pieces"]
+    out = tmp_path / "out" / "tiny"
+    assert all(_rate_of(out / row["audio"]) == 8000 for row in rows)

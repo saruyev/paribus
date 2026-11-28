@@ -42,11 +42,14 @@ class Clip:
         sample_rate: Frames per second.
         speech: Spans of speech in seconds, in any channel; empty for a clip without
             speech.
+        offset: Where the clip starts, in seconds, in the clip it was cut from by `split`;
+            0 for a clip that was not cut. Operations after the cut do not change it.
     """
 
     samples: Samples
     sample_rate: int
     speech: list[Span]
+    offset: float = 0.0
 
     def __post_init__(self) -> None:
         """Reject samples that are not (channels, frames), e.g. a forgotten mono axis.
@@ -155,6 +158,40 @@ def join(first: Clip, silence: Samples, second: Clip) -> Clip:
     shift = (first.frames + silence.shape[0]) / first.sample_rate
     moved = [(start + shift, end + shift) for start, end in second.speech]
     return replace(first, samples=samples, speech=[*first.speech, *moved])
+
+
+def split(clip: Clip, seconds: float, overlap: float = 0.0) -> list[Clip]:
+    """Cut a clip into windows of `seconds`, each starting `seconds - overlap` after the last.
+
+    This is what a pipeline does before sending long audio to a model. Windows are cut
+    in whole frames; the last one is shorter if the clip does not divide evenly, and no
+    window starts after one that already reached the end. Speech spans are cut to each
+    window and made local to it; `offset` says where the window starts.
+
+    Raises:
+        ValueError: If `seconds` is not positive or `overlap` is not below it.
+    """
+    if seconds <= 0 or not 0 <= overlap < seconds:
+        raise ValueError(
+            f"split needs seconds > 0 and 0 <= overlap < seconds, got {seconds}, {overlap}"
+        )
+    rate = clip.sample_rate
+    window = max(1, int(seconds * rate))
+    hop = max(1, window - int(overlap * rate))
+    pieces = []
+    for first in range(0, max(clip.frames, 1), hop):
+        last = min(first + window, clip.frames)
+        start, end = first / rate, last / rate
+        speech = [
+            (max(a, start) - start, min(b, end) - start)
+            for a, b in clip.speech
+            if min(b, end) > max(a, start)
+        ]
+        piece = Clip(clip.samples[:, first:last].copy(), rate, speech, clip.offset + start)
+        pieces.append(piece)
+        if last == clip.frames:
+            break
+    return pieces
 
 
 def generate(fill: Samples, sample_rate: int, channels: int = 1) -> Clip:

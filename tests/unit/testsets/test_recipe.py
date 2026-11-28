@@ -102,6 +102,7 @@ def test_a_no_speech_condition_starts_with_generate(tmp_path: Path) -> None:
         ({"name": "x", "ops": [{"gain": {"db": [3, -3]}}]}, "low end 3"),
         ({"name": "x", "ops": [{"codec": {"name": "pcm_mulaw", "bitrate": 8000}}]}, "opus only"),
         ({"name": "x y"}, "pattern"),
+        ({"name": "x", "ops": [{"split": {"seconds": [1, 5], "overlap": 1}}]}, "overlap below"),
     ],
 )
 def test_condition_mistakes_fail(tmp_path: Path, condition: dict[str, Any], message: str) -> None:

@@ -178,10 +178,14 @@ class Operation(_Model):
         shorthand: The setting a bare value stands for: `{gain: -20}` is `{gain: {db: -20}}`.
         starts_clip: True for an operation that makes a clip without speech from nothing
             (overrides `make`); it must be the first op of a `speech: none` condition.
+        splits: True for an operation that cuts a clip into pieces (overrides `expand`).
+            Every clip of a condition with such an operation is written as pieces of a
+            group, with `group_id` and `offset`, even one that came out in one piece.
     """
 
     shorthand: ClassVar[str | None] = None
     starts_clip: ClassVar[bool] = False
+    splits: ClassVar[bool] = False
 
     def apply(self, clip: Clip, ctx: OpContext) -> Clip:
         """Return the corrupted clip; keep `clip.speech` true to where speech now is."""
@@ -190,6 +194,14 @@ class Operation(_Model):
     def make(self, ctx: OpContext) -> Clip:
         """Return a new clip without speech (only for `starts_clip` operations)."""
         raise NotImplementedError(f"{type(self).__name__} does not make a clip")
+
+    def expand(self, clip: Clip, ctx: OpContext) -> list[Clip]:
+        """Return the clips this one becomes: itself corrupted, or its pieces (`splits`).
+
+        The operations after this one run on every piece separately, each piece with its
+        own copy of the `meta` drawn so far.
+        """
+        return [self.apply(clip, ctx)]
 
     def backgrounds(self) -> list[str]:
         """Names of the recipe backgrounds this operation draws from, checked at load."""
@@ -351,6 +363,37 @@ class Gain(Operation):
     def apply(self, clip: Clip, ctx: OpContext) -> Clip:
         """Draw the gain, record it, apply it."""
         return ops.gain(clip, ctx.value("gain_db", self.db, 2))
+
+
+@register_op("split")
+class Split(Operation):
+    """Cut a clip into windows, as a pipeline does before sending long audio to a model.
+
+    `seconds` is the window length, drawn once per clip; `overlap` is how much each
+    window repeats of the one before. Operations after `split` run on each piece, so
+    the order matters: `[resample, split]` resamples the whole file, `[split, resample]`
+    each piece.
+    """
+
+    seconds: Range
+    overlap: float = Field(default=0.0, ge=0)
+
+    shorthand: ClassVar[str | None] = "seconds"
+    splits: ClassVar[bool] = True
+
+    @model_validator(mode="after")
+    def _overlap_below_window(self) -> Self:
+        """Reject an overlap as long as the shortest window, which would never advance."""
+        low = self.seconds[0] if isinstance(self.seconds, tuple) else self.seconds
+        if low <= 0 or self.overlap >= low:
+            raise ValueError(f"split needs seconds > 0 and overlap below it, got {self.seconds}")
+        return self
+
+    def expand(self, clip: Clip, ctx: OpContext) -> list[Clip]:
+        """Draw the window length, record it and the overlap, and cut."""
+        seconds = ctx.value("split_seconds", self.seconds, 3)
+        ctx.note("split_overlap", self.overlap)
+        return ops.split(clip, seconds, self.overlap)
 
 
 def _unwrap_op(value: Any) -> Operation:

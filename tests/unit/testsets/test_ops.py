@@ -230,3 +230,36 @@ def test_generate_puts_the_fill_on_every_channel() -> None:
     clip = ops.generate(ops.noise_floor(_RATE, -40, np.random.default_rng(0)), _RATE, 2)
 
     assert clip.channels == 2 and np.array_equal(clip.samples[0], clip.samples[1])
+
+
+def test_split_cuts_windows_and_makes_speech_local() -> None:
+    """2.5 s in 1 s windows: three pieces, the last shorter; spans cut to each window."""
+    clip = Clip(_tone(2.5)[None, :], _RATE, [(0.5, 1.75)])
+
+    pieces = ops.split(clip, 1.0)
+
+    assert [piece.frames for piece in pieces] == [_RATE, _RATE, _RATE // 2]
+    assert [piece.offset for piece in pieces] == [0.0, 1.0, 2.0]
+    assert [piece.speech for piece in pieces] == [[(0.5, 1.0)], [(0.0, 0.75)], []]
+    assert np.array_equal(np.concatenate([p.samples for p in pieces], axis=1), clip.samples)
+
+
+def test_split_with_overlap_repeats_the_end_of_each_window() -> None:
+    """With 0.5 s overlap, 1 s windows start every 0.5 s and stop once one reaches the end."""
+    pieces = ops.split(_speech(2.0), 1.0, overlap=0.5)
+
+    assert [piece.offset for piece in pieces] == [0.0, 0.5, 1.0]
+    assert pieces[-1].frames == _RATE
+
+
+def test_split_of_a_piece_adds_up_the_offsets() -> None:
+    """Splitting a piece again keeps offsets on the timeline of the very first clip."""
+    (_, second) = ops.split(_speech(2.0), 1.0)
+
+    assert [piece.offset for piece in ops.split(second, 0.5)] == [1.0, 1.5]
+
+
+def test_split_refuses_a_window_that_never_advances() -> None:
+    """An overlap as long as the window would cut the same piece forever."""
+    with pytest.raises(ValueError, match="overlap < seconds"):
+        ops.split(_speech(), 1.0, overlap=1.0)
