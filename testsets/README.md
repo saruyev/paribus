@@ -86,10 +86,23 @@ speech:
     duration: [3, 20]                 # only phrases 3-20 s long
 ```
 
-To get exact word timings, so that VAD and timestamps can be scored, point
-`speech_segments_column` at a column of `{start, end}` spans. LibriSpeech with forced
-alignments has one (`gilkeyio/librispeech-alignments`, column `words`). Without it, the
-whole phrase counts as speech (`meta.speech_truth: utterance_bounds`).
+**Where speech is (`speech_segments`).** To score a VAD, or a model's timestamps, you
+need to know where in each phrase the words are, not just that the phrase has speech.
+Some datasets ship this as a column of forced alignments: one `{start, end}` item per word,
+in seconds. Open the dataset's viewer on the Hub, find such a column, and name it in
+`speech_segments_column`. For example, `gilkeyio/librispeech-alignments` has a `words`
+column of `{word, start, end}` items:
+
+```yaml
+      dataset: gilkeyio/librispeech-alignments
+      speech_segments_column: words   # extra keys such as `word` are ignored
+```
+
+Without such a column, the whole phrase counts as speech, and every clip says so with
+`meta.speech_truth: utterance_bounds`. That is still exact about added silence and about
+clips with no speech. It is only coarse inside the phrase.
+
+All settings of every source type are listed under [Source settings](#source-settings).
 
 Backgrounds work the same way. A pool that mixes licenses, like MUSAN noise, can be
 filtered to the ones you are allowed to use:
@@ -148,6 +161,107 @@ backgrounds:
     source: {type: folder, root: /data/office-noise, license: private}
 ```
 
+### Source settings
+
+Every source has these settings:
+
+| Setting | Meaning |
+|---|---|
+| `type` | `hf`, `folder` or `manifest`, or a type a plugin adds (see below). |
+| `license` | Required: the terms of the data, or `private` for your own. It goes into `sources.json`. |
+| `name` | Optional. It becomes the middle part of clip ids and must differ between inputs. It defaults to the dataset, the folder, or the manifest file name. |
+
+**`hf`**: a Hugging Face Hub dataset, streamed. It needs the `hf` extra.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `dataset` | | The repository id, e.g. `google/fleurs`. |
+| `revision` | | A commit sha or tag. It is required, so two builds never read different data. |
+| `subset` | none | The dataset's configuration, e.g. `ru_ru`. |
+| `split` | | e.g. `test`. |
+| `audio_column` | `audio` | The column holding the audio. |
+| `text_column` | none | The column holding a transcript. |
+| `transcripts` | `none` | What `text_column` is: `reference` (gold) or `output` (a model's). |
+| `id_column` | none | The column holding ids. Without it, ids are `<split>/<row>`. |
+| `language` | none | The expected language of every row, e.g. `en`. |
+| `meta_columns` | `[]` | Columns copied into each clip's `meta`. |
+| `speech_segments_column` | none | The column of `{start, end}` spans or `[start, end]` pairs, in seconds. |
+| `limit` | none | Read only the first N rows. |
+| `cache_dir` | `~/.cache/paribus/hf` | Where audio files are cached. |
+
+**`folder`**: every audio file under a folder, recursively.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `root` | | The folder. |
+| `patterns` | wav, flac, mp3, ogg, opus, m4a, webm | Glob patterns of audio files. |
+| `transcripts` | `none` | What the text file next to each audio file is: `reference` or `output`. |
+| `transcript_suffix` | `.txt` | The text file's suffix: `a/001.wav` pairs with `a/001.txt`. |
+| `language` | none | The expected language of every file. |
+
+**`manifest`**: a `.jsonl` or `.csv` file of records in the paribus format (`id`,
+`audio`, `language`, `reference`, `speech_segments`, `meta`...).
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `path` | | The file. Its suffix picks the format. Audio paths are relative to it. |
+| `time_unit` | `s` | `s` or `ms`, for every time in the file. |
+| `meta_types` | `{}` | Types of `meta` keys, e.g. `{snr: float}`. These are parsed from CSV text and checked in JSONL. |
+
+**Another kind of source** (a database, an object store, your call system's export) is
+a class with `name`, `license` and `records()`, plus a config class. You register it from
+a plugin, the same way as an operation (see [4](#4-add-your-own-logic)):
+
+```python
+"""My call store as a paribus source."""
+
+import csv
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Literal
+
+from paribus.engine.data import SourceConfig, register_source
+from paribus.engine.types import SampleRecord
+
+
+class CallStoreConfig(SourceConfig):
+    """Settings of my call store's CSV export."""
+
+    type: Literal["call_store"] = "call_store"
+    export: Path
+
+
+class CallStoreSource:
+    """One record per row of the export: `call_id,file,transcript`."""
+
+    def __init__(self, config: CallStoreConfig) -> None:
+        """Keep the config; nothing is read until `records()`."""
+        self.config = config
+        self.name = config.name or "call_store"
+        self.license = config.license
+
+    def records(self) -> Iterator[SampleRecord]:
+        """Yield one record per row."""
+        with self.config.export.open(encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                yield SampleRecord(
+                    id=row["call_id"],
+                    audio=self.config.export.parent / row["file"],
+                    reference=row["transcript"] or None,
+                    language="en",
+                )
+
+
+register_source("call_store", CallStoreConfig, CallStoreSource)
+```
+
+```yaml
+plugins: [my_sources]
+speech:
+  - source: {type: call_store, export: /data/calls.csv, license: private}
+    take: 100
+```
+
 ### 3. Use the built-in logic
 
 A **condition** is a name plus a list of operations applied in order. `clean`, with no
@@ -195,6 +309,20 @@ conditions:
 
 If an operation repeats in one condition, its meta keys get suffixes: `pad_before`,
 `pad_before_2`.
+
+**A dataset as it is.** A condition with no operations, like `clean`, keeps the
+phrases undamaged. They are still converted to mono 16-bit wav at the recipe's
+`sample_rate` (16 kHz by default), and you still get `take`, `duration` and the manifest.
+A recipe with only `clean` is a way to cut a fixed, reproducible sample out of a large
+dataset:
+
+```yaml
+conditions:
+  - name: clean
+```
+
+If you want neither a sample nor a conversion, you do not need `testsets` at all. paribus
+reads `hf`, `folder` and `manifest` sources directly, with the same settings as above.
 
 **Long clips.** `concat` on a speech input joins consecutive phrases of one group, such
 as a book chapter, into long clips before any condition runs. Models split long audio
