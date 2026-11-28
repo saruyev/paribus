@@ -7,7 +7,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from testsets.recipe import Codec, Generate, Mix, Pad, Resample, load_recipe
+from testsets.recipe import Codec, Generate, Mix, Operation, Pad, Resample, load_recipe, register_op
 
 _SPEECH = {"source": {"type": "folder", "root": "speech", "license": "CC-BY-4.0"}, "take": 5}
 _BACKGROUNDS = {"music": {"source": {"type": "folder", "root": "music", "license": "CC-BY-3.0"}}}
@@ -154,3 +154,12 @@ def test_concat_settings_are_validated(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError, match="low end 300"):
         load_recipe(_recipe(tmp_path, speech=[speech]))
+
+
+def test_an_operation_name_cannot_be_registered_twice() -> None:
+    """A plugin cannot silently replace a built-in operation or another plugin's."""
+    with pytest.raises(ValueError, match="'mix' is already registered"):
+
+        @register_op("mix")
+        class _Mine(Operation):
+            """Another `mix`."""

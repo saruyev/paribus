@@ -2,13 +2,15 @@
 
 import json
 import wave
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
 
 from paribus.engine.data import ManifestConfig, ManifestSource
+from testsets import Clip, OpContext, Operation, Range, register_op
 from testsets.build import build
 from testsets.recipe import Recipe
 
@@ -134,6 +136,38 @@ def test_padding_moves_the_speech_spans(inputs: Path, tmp_path: Path) -> None:
         with wave.open(str(manifest.parent / row["audio"])) as clip:
             seconds = clip.getnframes() / clip.getframerate()
         assert seconds == pytest.approx(end + row["meta"]["pad_after"], abs=1e-3)
+
+
+@register_op("test_mute_start")
+class _MuteStart(Operation):
+    """Silence the first `seconds` of a clip: a stand-in for a user's own operation."""
+
+    seconds: Range
+
+    shorthand: ClassVar[str | None] = "seconds"
+
+    def apply(self, clip: Clip, ctx: OpContext) -> Clip:
+        """Zero the drawn number of leading frames, recording the length in `meta`."""
+        frames = int(ctx.value("muted", self.seconds, 3) * clip.sample_rate)
+        samples = clip.samples.copy()
+        samples[:frames] = 0
+        return replace(clip, samples=samples)
+
+
+def test_an_operation_from_outside_runs_like_a_built_in(inputs: Path, tmp_path: Path) -> None:
+    """A registered operation is used from YAML, draws through the context, lands in meta."""
+    condition = {"name": "muted", "ops": [{"test_mute_start": [0.1, 0.3]}]}
+
+    rows = _rows(build(_recipe(inputs, condition), tmp_path / "out"))
+
+    for row in rows:
+        muted = row["meta"]["muted"]
+        assert 0.1 <= muted <= 0.3
+        with wave.open(str(tmp_path / "out" / "tiny" / row["audio"])) as clip:
+            pcm = np.frombuffer(clip.readframes(clip.getnframes()), dtype="<i2")
+        edge = int(muted * _RATE)  # `meta` is rounded to 1 ms, so allow 16 frames
+        assert not pcm[: edge - 16].any()
+        assert pcm[edge + 16 :].any()
 
 
 def test_rebuild_is_byte_identical(inputs: Path, tmp_path: Path) -> None:

@@ -8,9 +8,11 @@ Settings that vary from clip to clip are a `Range`: a number for a fixed value, 
 `[low, high]` for a value drawn uniformly per clip from the recipe's seed.
 """
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, Any, ClassVar, Literal, Self
+from typing import Annotated, Any, ClassVar, Literal, Protocol, Self
 
+import numpy as np
 import yaml
 from pydantic import (
     AfterValidator,
@@ -22,6 +24,9 @@ from pydantic import (
 )
 
 from paribus.engine.data import build_source
+from paribus.engine.types import MetaValue
+from testsets import ops
+from testsets.ops import Clip, Samples
 
 
 def _ordered(value: float | tuple[float, float]) -> float | tuple[float, float]:
@@ -129,63 +134,180 @@ class Background(_Model):
         return self
 
 
-class _Op(_Model):
-    """Base of operations; `shorthand` names the setting a bare value stands for."""
+class OpContext(Protocol):
+    """What an operation gets from the build for the one clip it is working on.
+
+    Everything random goes through it, so a build stays reproducible from the seed, and
+    every drawn setting lands in the clip's `meta`, so results can be sliced by it.
+    """
+
+    @property
+    def rng(self) -> np.random.Generator:
+        """The clip's random generator; draw from it, never from a global one."""
+        ...
+
+    @property
+    def sample_rate(self) -> int:
+        """The recipe's sample rate, the rate of a clip an operation makes from nothing."""
+        ...
+
+    def value(self, key: str, setting: Range, digits: int) -> float:
+        """Draw a setting (fixed or a range), record it in `meta` under `key`, return it."""
+        ...
+
+    def note(self, key: str, value: MetaValue) -> None:
+        """Record a value in `meta`; a repeated key gets `_2`, `_3`..."""
+        ...
+
+    def fill(self, fill: str, frames: int, floor_dbfs: float) -> Samples:
+        """`frames` of `zero`, a noise `floor` at `floor_dbfs`, or a background's stretch."""
+        ...
+
+
+class Operation(_Model):
+    """Base of every operation, built in or your own: its settings plus what it does.
+
+    A subclass declares its settings as fields (validated when the recipe loads) and
+    overrides `apply`. It becomes usable in recipes once registered with `register_op`.
+
+    Attributes:
+        shorthand: The setting a bare value stands for: `{gain: -20}` is `{gain: {db: -20}}`.
+        starts_clip: True for an operation that makes a clip without speech from nothing
+            (overrides `make`); it must be the first op of a `speech: none` condition.
+    """
 
     shorthand: ClassVar[str | None] = None
+    starts_clip: ClassVar[bool] = False
+
+    def apply(self, clip: Clip, ctx: OpContext) -> Clip:
+        """Return the corrupted clip; keep `clip.speech` true to where speech now is."""
+        raise NotImplementedError(f"{type(self).__name__} does not change a clip")
+
+    def make(self, ctx: OpContext) -> Clip:
+        """Return a new clip without speech (only for `starts_clip` operations)."""
+        raise NotImplementedError(f"{type(self).__name__} does not make a clip")
+
+    def backgrounds(self) -> list[str]:
+        """Names of the recipe backgrounds this operation draws from, checked at load."""
+        return []
 
 
-class Mix(_Op):
+_OPS: dict[str, type[Operation]] = {}
+
+
+def register_op[O: type[Operation]](name: str) -> Callable[[O], O]:
+    """Class decorator that makes an `Operation` usable in recipes as `name`.
+
+    Raises:
+        ValueError: If `name` is already taken, so two plugins cannot silently swap
+            one operation for another.
+    """
+
+    def add(cls: O) -> O:
+        """Register `cls` under `name` and return it unchanged."""
+        if name in _OPS:
+            raise ValueError(f"operation {name!r} is already registered by {_OPS[name]}")
+        _OPS[name] = cls
+        return cls
+
+    return add
+
+
+def _fill_backgrounds(fill: str) -> list[str]:
+    """The background a fill names, or nothing for a built-in fill."""
+    return [] if fill in _BUILT_IN_FILLS else [fill]
+
+
+@register_op("mix")
+class Mix(Operation):
     """Mix a background under the speech at `snr_db`, measured against the speech's RMS."""
 
-    op: Literal["mix"] = "mix"
     background: str
     snr_db: Range
 
     shorthand: ClassVar[str | None] = "background"
 
+    def apply(self, clip: Clip, ctx: OpContext) -> Clip:
+        """Draw the SNR, take a background stretch as long as the clip, mix it in."""
+        snr_db = ctx.value("snr_db", self.snr_db, 2)
+        return ops.mix(clip, ctx.fill(self.background, clip.frames, 0.0), snr_db)
 
-class Pad(_Op):
+    def backgrounds(self) -> list[str]:
+        """The background mixed in."""
+        return [self.background]
+
+
+@register_op("pad")
+class Pad(Operation):
     """Add `before` and `after` seconds of `fill` around the speech.
 
     `fill` is `zero` (digital silence), `floor` (white noise at `floor_dbfs`) or the name
     of a background.
     """
 
-    op: Literal["pad"] = "pad"
     before: Range = 0.0
     after: Range = 0.0
     fill: str = "zero"
     floor_dbfs: float = -60.0
 
+    def apply(self, clip: Clip, ctx: OpContext) -> Clip:
+        """Draw both lengths in whole frames, record them, and pad with one fill."""
+        rate = clip.sample_rate
+        before = int(ops.draw(self.before, ctx.rng) * rate)
+        after = int(ops.draw(self.after, ctx.rng) * rate)
+        # Recorded from the frame counts, so the meta matches the audio exactly.
+        ctx.note("pad_before", round(before / rate, 3))
+        ctx.note("pad_after", round(after / rate, 3))
+        filler = ctx.fill(self.fill, before + after, self.floor_dbfs)
+        return ops.pad(clip, filler[:before], filler[before:])
 
-class Generate(_Op):
+    def backgrounds(self) -> list[str]:
+        """The fill's background, if it is one."""
+        return _fill_backgrounds(self.fill)
+
+
+@register_op("generate")
+class Generate(Operation):
     """Make a clip without speech: `seconds` of `fill` (as in `Pad`)."""
 
-    op: Literal["generate"] = "generate"
     fill: str
     seconds: Range
     floor_dbfs: float = -60.0
 
     shorthand: ClassVar[str | None] = "fill"
+    starts_clip: ClassVar[bool] = True
+
+    def make(self, ctx: OpContext) -> Clip:
+        """Draw the length and fill it, at the recipe's sample rate."""
+        frames = int(ctx.value("seconds", self.seconds, 3) * ctx.sample_rate)
+        return ops.generate(ctx.fill(self.fill, frames, self.floor_dbfs), ctx.sample_rate)
+
+    def backgrounds(self) -> list[str]:
+        """The fill's background, if it is one."""
+        return _fill_backgrounds(self.fill)
 
 
-class Resample(_Op):
+@register_op("resample")
+class Resample(Operation):
     """Change the sample rate, e.g. to 8000 to imitate narrowband telephony."""
 
-    op: Literal["resample"] = "resample"
     rate: int = Field(gt=0)
 
     shorthand: ClassVar[str | None] = "rate"
 
+    def apply(self, clip: Clip, ctx: OpContext) -> Clip:
+        """Resample, and record the rate the clip ends up at."""
+        ctx.note("sample_rate_out", self.rate)
+        return ops.resample(clip, self.rate)
 
-class Codec(_Op):
+
+@register_op("codec")
+class Codec(Operation):
     """Encode with a lossy codec and decode back, keeping the codec's artifacts.
 
     `bitrate` (bits per second) applies to `opus` only.
     """
 
-    op: Literal["codec"] = "codec"
     name: Literal["pcm_mulaw", "pcm_alaw", "opus"]
     bitrate: int | None = Field(default=None, gt=0)
 
@@ -198,41 +320,45 @@ class Codec(_Op):
             raise ValueError(f"bitrate applies to opus only, not {self.name}")
         return self
 
+    def apply(self, clip: Clip, ctx: OpContext) -> Clip:
+        """Round-trip through the codec, and record which one (with its bitrate)."""
+        ctx.note("codec", self.name if self.bitrate is None else f"{self.name}@{self.bitrate}")
+        return ops.codec(clip, self.name, self.bitrate)
 
-class Gain(_Op):
+
+@register_op("gain")
+class Gain(Operation):
     """Change the level by `db` decibels (negative is quieter)."""
 
-    op: Literal["gain"] = "gain"
     db: Range
 
     shorthand: ClassVar[str | None] = "db"
 
-
-_OPS: dict[str, type[_Op]] = {
-    "mix": Mix,
-    "pad": Pad,
-    "generate": Generate,
-    "resample": Resample,
-    "codec": Codec,
-    "gain": Gain,
-}
-
-type Op = Annotated[Mix | Pad | Generate | Resample | Codec | Gain, Field(discriminator="op")]
+    def apply(self, clip: Clip, ctx: OpContext) -> Clip:
+        """Draw the gain, record it, apply it."""
+        return ops.gain(clip, ctx.value("gain_db", self.db, 2))
 
 
-def _unwrap_op(value: Any) -> Any:
-    """Turn the YAML form `{mix: {...}}` or `{resample: 8000}` into `{op: mix, ...}`."""
+def _unwrap_op(value: Any) -> Operation:
+    """Turn the YAML form `{mix: {...}}` or `{resample: 8000}` into a registered operation.
+
+    Raises:
+        ValueError: If the form is wrong, the operation is unknown, or its settings are
+            invalid (the settings' own error is included).
+    """
+    if isinstance(value, Operation):
+        return value
     if not isinstance(value, dict) or len(value) != 1:
         raise ValueError(f"an operation is a mapping with one key, one of: {', '.join(_OPS)}")
     ((name, settings),) = value.items()
     if name not in _OPS:
         raise ValueError(f"unknown operation {name!r}, known: {', '.join(_OPS)}")
+    cls = _OPS[name]
     if not isinstance(settings, dict):
-        shorthand = _OPS[name].shorthand
-        if shorthand is None:
+        if cls.shorthand is None:
             raise ValueError(f"operation {name!r} needs a mapping of settings")
-        settings = {shorthand: settings}
-    return {"op": name, **settings}
+        settings = {cls.shorthand: settings}
+    return cls.model_validate(settings)
 
 
 class Condition(_Model):
@@ -249,7 +375,7 @@ class Condition(_Model):
     name: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
     speech: Literal["all", "none"] = "all"
     count: int | None = Field(default=None, ge=1)
-    ops: list[Op] = Field(default_factory=list)
+    ops: list[Operation] = Field(default_factory=list)
 
     @field_validator("ops", mode="before")
     @classmethod
@@ -259,14 +385,17 @@ class Condition(_Model):
 
     @model_validator(mode="after")
     def _generate_iff_no_speech(self) -> Self:
-        """A clip is either speech or generated: `generate` comes first, and only then."""
-        generates = [isinstance(op, Generate) for op in self.ops]
+        """A clip is speech or made from nothing: a clip-making op comes first, and only then."""
+        starts = [op.starts_clip for op in self.ops]
         if self.speech == "none":
-            if not generates or not generates[0] or self.count is None:
-                raise ValueError("speech: none needs count and must start with generate")
-            if any(generates[1:]):
-                raise ValueError("generate can only be the first operation")
-        elif any(generates) or self.count is not None:
+            if not starts or not starts[0] or self.count is None:
+                raise ValueError(
+                    "speech: none needs count and must start with generate "
+                    "(or another operation that makes a clip)"
+                )
+            if any(starts[1:]):
+                raise ValueError("an operation that makes a clip can only be the first one")
+        elif any(starts) or self.count is not None:
             raise ValueError("generate and count are only for speech: none")
         return self
 
@@ -308,21 +437,12 @@ class Recipe(_Model):
             raise ValueError(f"condition names repeat: {', '.join(duplicates)}")
         for condition in self.conditions:
             for op in condition.ops:
-                background = _background_of(op)
-                if background is not None and background not in self.backgrounds:
-                    raise ValueError(
-                        f"condition {condition.name!r} uses unknown background {background!r}"
-                    )
+                for background in op.backgrounds():
+                    if background not in self.backgrounds:
+                        raise ValueError(
+                            f"condition {condition.name!r} uses unknown background {background!r}"
+                        )
         return self
-
-
-def _background_of(op: _Op) -> str | None:
-    """Return the background an operation draws from, if it draws from one."""
-    if isinstance(op, Mix):
-        return op.background
-    if isinstance(op, Pad | Generate) and op.fill not in _BUILT_IN_FILLS:
-        return op.fill
-    return None
 
 
 def load_recipe(path: Path) -> Recipe:

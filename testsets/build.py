@@ -30,22 +30,7 @@ from paribus.engine.data import build_source
 from paribus.engine.types import MetaValue, SampleRecord
 from testsets import ops
 from testsets.ops import Clip, Samples
-from testsets.recipe import (
-    Background,
-    Codec,
-    Concat,
-    Condition,
-    Gain,
-    Generate,
-    Mix,
-    Op,
-    Pad,
-    Range,
-    Recipe,
-    Resample,
-    SpeechInput,
-    load_recipe,
-)
+from testsets.recipe import Background, Concat, Condition, Range, Recipe, SpeechInput, load_recipe
 
 
 @dataclass(frozen=True)
@@ -96,15 +81,23 @@ class Pool:
 
 
 @dataclass
-class _Draw:
-    """One clip's random generator, and the record in `meta` of what it drew.
+class _Context:
+    """The `OpContext` of one clip: its generator, its `meta`, and the build's fills.
 
     Every drawn setting is written down, so slice search can later tell which SNR or
     pad length a clip got.
+
+    Attributes:
+        rng: The clip's own generator.
+        meta: What the clip's operations drew and noted.
+        sample_rate: The recipe's sample rate.
+        pools: Decoded backgrounds by name, for `fill`.
     """
 
     rng: np.random.Generator
     meta: dict[str, MetaValue]
+    sample_rate: int
+    pools: Mapping[str, Pool]
 
     def value(self, key: str, setting: Range, digits: int) -> float:
         """Draw a setting (fixed or a range), record it rounded under `key`, return it."""
@@ -119,6 +112,16 @@ class _Draw:
             number += 1
             name = f"{key}_{number}"
         self.meta[name] = value
+
+    def fill(self, fill: str, frames: int, floor_dbfs: float) -> Samples:
+        """Make `frames` of digital zero, a noise floor, or a random background stretch."""
+        if fill == "zero":
+            return ops.zeros(frames)
+        if fill == "floor":
+            return ops.noise_floor(frames, floor_dbfs, self.rng)
+        background_id, samples = self.pools[fill].pick(self.rng)
+        self.note("background_id", background_id)
+        return ops.excerpt(samples, frames, self.rng) if frames else ops.zeros(0)
 
 
 @dataclass(frozen=True)
@@ -358,52 +361,13 @@ class _Build:
         salt = zlib.crc32(condition.name.encode())
         made = []
         for number, (phrase, clip) in enumerate(starts):
-            draw = _Draw(np.random.default_rng([self.recipe.seed, salt, number]), {})
-            draw.meta["condition"] = condition.name
+            rng = np.random.default_rng([self.recipe.seed, salt, number])
+            ctx = _Context(rng, {"condition": condition.name}, self.recipe.sample_rate, self.pools)
             for op in condition.ops:
-                clip = self.apply(op, clip, draw)
-            assert clip is not None  # a no-speech condition starts with generate
-            made.append(_Made(condition, number, phrase, clip, draw.meta))
+                clip = op.make(ctx) if clip is None else op.apply(clip, ctx)
+            assert clip is not None  # a no-speech condition starts with a clip-making op
+            made.append(_Made(condition, number, phrase, clip, ctx.meta))
         return made
-
-    def apply(self, op: Op, clip: Clip | None, draw: _Draw) -> Clip:
-        """Apply one operation, drawing its settings through `draw`."""
-        if isinstance(op, Generate):
-            rate = self.recipe.sample_rate
-            frames = int(draw.value("seconds", op.seconds, 3) * rate)
-            return ops.generate(self.fill(op.fill, frames, op.floor_dbfs, draw), rate)
-        assert clip is not None  # only generate starts from nothing
-        if isinstance(op, Mix):
-            snr_db = draw.value("snr_db", op.snr_db, 2)
-            return ops.mix(clip, self.fill(op.background, clip.frames, 0.0, draw), snr_db)
-        if isinstance(op, Pad):
-            rate = clip.sample_rate
-            before = int(ops.draw(op.before, draw.rng) * rate)
-            after = int(ops.draw(op.after, draw.rng) * rate)
-            # Recorded from the frame counts, so the meta matches the audio exactly.
-            draw.note("pad_before", round(before / rate, 3))
-            draw.note("pad_after", round(after / rate, 3))
-            filler = self.fill(op.fill, before + after, op.floor_dbfs, draw)
-            return ops.pad(clip, filler[:before], filler[before:])
-        if isinstance(op, Resample):
-            draw.note("sample_rate_out", op.rate)
-            return ops.resample(clip, op.rate)
-        if isinstance(op, Codec):
-            draw.note("codec", op.name if op.bitrate is None else f"{op.name}@{op.bitrate}")
-            return ops.codec(clip, op.name, op.bitrate)
-        if isinstance(op, Gain):
-            return ops.gain(clip, draw.value("gain_db", op.db, 2))
-        raise TypeError(f"unhandled operation {op!r}")
-
-    def fill(self, fill: str, frames: int, floor_dbfs: float, draw: _Draw) -> Samples:
-        """Make `frames` of digital zero, a noise floor, or a random background stretch."""
-        if fill == "zero":
-            return ops.zeros(frames)
-        if fill == "floor":
-            return ops.noise_floor(frames, floor_dbfs, draw.rng)
-        background_id, samples = self.pools[fill].pick(draw.rng)
-        draw.note("background_id", background_id)
-        return ops.excerpt(samples, frames, draw.rng) if frames else ops.zeros(0)
 
 
 def _write_clip(root: Path, made: _Made) -> SampleRecord:
