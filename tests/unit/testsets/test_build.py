@@ -178,3 +178,108 @@ def test_sources_json_lists_inputs_with_licenses(inputs: Path, tmp_path: Path) -
     assert music["role"] == "background:music"
     assert music["clips_in_pool_by_license"] == {"CC-BY-3.0": 2}
     assert music["clips_used"] == 3
+
+
+@pytest.fixture
+def chapters(tmp_path: Path) -> Path:
+    """`chapters/`: chapter 1-1 with five 2-second phrases, chapter 1-2 with one."""
+    for name in ["1-1-0003", "1-1-0001", "1-1-0002", "1-1-0004", "1-1-0005", "1-2-0001"]:
+        _write_tone(tmp_path / "chapters" / f"{name}.wav", 2.0, 400)
+        (tmp_path / "chapters" / f"{name}.txt").write_text(name, encoding="utf-8")
+    return tmp_path / "chapters"
+
+
+def _long_recipe(root: Path, take: int, **concat: Any) -> Recipe:
+    """A recipe that joins the chapter phrases into long clips."""
+    return Recipe.model_validate(
+        {
+            "name": "long",
+            "seed": 3,
+            "speech": [
+                {
+                    "source": {
+                        "type": "folder",
+                        "root": str(root),
+                        "license": "CC0-1.0",
+                        "transcripts": "reference",
+                    },
+                    "take": take,
+                    "concat": {"seconds": [4, 5], "gap": 0.5, **concat},
+                }
+            ],
+            "conditions": [{"name": "clean"}],
+        }
+    )
+
+
+def _rows(manifest: Path) -> list[dict[str, Any]]:
+    """The manifest's rows as plain dicts."""
+    return [json.loads(line) for line in manifest.read_text().splitlines()]
+
+
+def test_concat_joins_consecutive_phrases_of_a_chapter(chapters: Path, tmp_path: Path) -> None:
+    """Parts follow id order within a chapter; chapters are not mixed; leftovers are dropped.
+
+    Two 2-second phrases and a 0.5 s gap make 4.5 s, inside [4, 5]; a third would pass 5.
+    Chapter 1-1 gives two such clips and a dropped leftover; chapter 1-2 is too short.
+    """
+    manifest = build(_long_recipe(chapters, take=2), tmp_path / "out")
+
+    rows = _rows(manifest)
+
+    assert [row["reference"] for row in rows] == ["1-1-0001 1-1-0002", "1-1-0003 1-1-0004"]
+    assert all(row["meta"]["concat_parts"] == 2 for row in rows)
+    assert all(row["meta"]["concat_group"] == "1-1" for row in rows)
+    assert rows[0]["id"] == "clean/chapters/1-1-0001+2"
+
+
+def test_concat_shifts_speech_by_parts_and_gaps(chapters: Path, tmp_path: Path) -> None:
+    """The second part's speech starts after the first part and the silence between them."""
+    manifest = build(_long_recipe(chapters, take=2), tmp_path / "out")
+
+    row = _rows(manifest)[0]
+
+    assert row["speech_segments"] == [[0.0, 2.0], [2.5, 4.5]]
+    with wave.open(str(manifest.parent / row["audio"])) as clip:
+        assert clip.getnframes() == int(4.5 * _RATE)
+
+
+def test_concat_with_too_few_long_clips_is_an_error(chapters: Path, tmp_path: Path) -> None:
+    """Only two long clips can be made; asking for three fails."""
+    with pytest.raises(ValueError, match="has 2 long clips, the recipe takes 3"):
+        build(_long_recipe(chapters, take=3), tmp_path / "out")
+
+
+def test_concat_groups_by_a_meta_key(tmp_path: Path) -> None:
+    """With `group_by: speaker`, phrases join by the speaker in their metadata."""
+    speakers = {"a": "s1", "b": "s2", "c": "s1", "d": "s2"}
+    for name in speakers:
+        _write_tone(tmp_path / f"{name}.wav", 2.0, 400)
+    lines = [
+        json.dumps({"id": n, "audio": f"{n}.wav", "reference": n, "meta": {"speaker": s}})
+        for n, s in speakers.items()
+    ]
+    (tmp_path / "m.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    recipe = Recipe.model_validate(
+        {
+            "name": "long",
+            "seed": 3,
+            "speech": [
+                {
+                    "source": {
+                        "type": "manifest",
+                        "path": str(tmp_path / "m.jsonl"),
+                        "license": "x",
+                    },
+                    "take": 2,
+                    "concat": {"seconds": [4, 5], "gap": 0.5, "group_by": "speaker"},
+                }
+            ],
+            "conditions": [{"name": "clean"}],
+        }
+    )
+
+    rows = _rows(build(recipe, tmp_path / "out"))
+
+    assert sorted(row["reference"] for row in rows) == ["a c", "b d"]
+    assert all(row["meta"]["speaker"] == row["meta"]["concat_group"] for row in rows)

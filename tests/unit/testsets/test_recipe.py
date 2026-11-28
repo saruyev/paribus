@@ -146,3 +146,11 @@ def test_duration_filter_must_be_ordered(tmp_path: Path) -> None:
     """A duration filter of [20, 3] would keep nothing."""
     with pytest.raises(ValidationError, match="duration"):
         load_recipe(_recipe(tmp_path, speech=[{**_SPEECH, "duration": [20, 3]}]))
+
+
+def test_concat_settings_are_validated(tmp_path: Path) -> None:
+    """A concat block with a reversed length range fails at load time."""
+    speech = {**_SPEECH, "concat": {"seconds": [300, 30]}}
+
+    with pytest.raises(ValidationError, match="low end 300"):
+        load_recipe(_recipe(tmp_path, speech=[speech]))

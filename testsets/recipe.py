@@ -56,18 +56,46 @@ def _check_source(value: dict[str, Any]) -> dict[str, Any]:
 type SourceSettings = Annotated[dict[str, Any], AfterValidator(_check_source)]
 
 
+class Concat(_Model):
+    """Join consecutive phrases of one group (a book chapter) into long clips.
+
+    Long recordings behave differently from short phrases (models cut them into
+    windows, and hallucinate at the seams), so they get their own clips. Phrases are
+    grouped, sorted by id within a group, and joined in that order until a clip reaches
+    its drawn length.
+
+    Attributes:
+        seconds: Target length of each long clip, drawn per clip; a clip never gets
+            longer than the high end unless a single phrase is, and a leftover shorter
+            than the low end is dropped.
+        gap: Digital silence between joined phrases, drawn per gap. Noise over the whole
+            clip is a condition's job, so the clean long clip stays clean.
+        group_by: `id_prefix` groups by the record id up to its last `separator`
+            (`1089-134686-0000` -> `1089-134686`); any other value is a `meta` key.
+        separator: Separator for `id_prefix`.
+    """
+
+    seconds: Range
+    gap: Range = 0.5
+    group_by: str = "id_prefix"
+    separator: str = Field(default="-", min_length=1)
+
+
 class SpeechInput(_Model):
     """Where source phrases come from and how many to take.
 
     Attributes:
         source: A source config, exactly as `paribus.engine.data.build_source` takes it.
-        take: Number of phrases to keep from this source.
-        duration: Keep only phrases whose length in seconds is within `[low, high]`.
+        take: Number of phrases to keep from this source (long clips, with `concat`).
+        duration: Keep only phrases whose length in seconds is within `[low, high]`;
+            with `concat`, this filters the phrases before they are joined.
+        concat: Join phrases into long clips before any condition is applied.
     """
 
     source: SourceSettings
     take: int = Field(ge=1)
     duration: tuple[float, float] | None = None
+    concat: Concat | None = None
 
     @field_validator("duration")
     @classmethod
