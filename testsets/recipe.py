@@ -152,7 +152,7 @@ class OpContext(Protocol):
 
     @property
     def sample_rate(self) -> int:
-        """The recipe's sample rate, the rate of a clip an operation makes from nothing."""
+        """Rate for a clip made from nothing: the recipe's, or 16000 if it is `native`."""
         ...
 
     def value(self, key: str, setting: Range, digits: int) -> float:
@@ -163,8 +163,8 @@ class OpContext(Protocol):
         """Record a value in `meta`; a repeated key gets `_2`, `_3`..."""
         ...
 
-    def fill(self, fill: str, frames: int, floor_dbfs: float) -> Samples:
-        """`frames` of `zero`, a noise `floor` at `floor_dbfs`, or a background's stretch."""
+    def fill(self, fill: str, frames: int, floor_dbfs: float, sample_rate: int) -> Samples:
+        """`frames` at `sample_rate` of `zero`, a noise `floor`, or a background's stretch."""
         ...
 
 
@@ -234,7 +234,8 @@ class Mix(Operation):
     def apply(self, clip: Clip, ctx: OpContext) -> Clip:
         """Draw the SNR, take a background stretch as long as the clip, mix it in."""
         snr_db = ctx.value("snr_db", self.snr_db, 2)
-        return ops.mix(clip, ctx.fill(self.background, clip.frames, 0.0), snr_db)
+        background = ctx.fill(self.background, clip.frames, 0.0, clip.sample_rate)
+        return ops.mix(clip, background, snr_db)
 
     def backgrounds(self) -> list[str]:
         """The background mixed in."""
@@ -262,7 +263,7 @@ class Pad(Operation):
         # Recorded from the frame counts, so the meta matches the audio exactly.
         ctx.note("pad_before", round(before / rate, 3))
         ctx.note("pad_after", round(after / rate, 3))
-        filler = ctx.fill(self.fill, before + after, self.floor_dbfs)
+        filler = ctx.fill(self.fill, before + after, self.floor_dbfs, rate)
         return ops.pad(clip, filler[:before], filler[before:])
 
     def backgrounds(self) -> list[str]:
@@ -272,19 +273,25 @@ class Pad(Operation):
 
 @register_op("generate")
 class Generate(Operation):
-    """Make a clip without speech: `seconds` of `fill` (as in `Pad`)."""
+    """Make a clip without speech: `seconds` of `fill` (as in `Pad`).
+
+    `sample_rate` is the new clip's rate; without it, the recipe's rate, or 16000 when
+    the recipe keeps each file's own rate.
+    """
 
     fill: str
     seconds: Range
     floor_dbfs: float = -60.0
+    sample_rate: int | None = Field(default=None, gt=0)
 
     shorthand: ClassVar[str | None] = "fill"
     starts_clip: ClassVar[bool] = True
 
     def make(self, ctx: OpContext) -> Clip:
         """Draw the length and fill it, at the recipe's sample rate."""
-        frames = int(ctx.value("seconds", self.seconds, 3) * ctx.sample_rate)
-        return ops.generate(ctx.fill(self.fill, frames, self.floor_dbfs), ctx.sample_rate)
+        rate = self.sample_rate or ctx.sample_rate
+        frames = int(ctx.value("seconds", self.seconds, 3) * rate)
+        return ops.generate(ctx.fill(self.fill, frames, self.floor_dbfs, rate), rate)
 
     def backgrounds(self) -> list[str]:
         """The fill's background, if it is one."""
@@ -410,7 +417,9 @@ class Recipe(_Model):
     Attributes:
         name: Name of the test set; becomes the output folder.
         seed: Seed of every random choice, so a recipe always builds the same clips.
-        sample_rate: Rate of the speech before any `resample` operation.
+        sample_rate: `native` keeps every file at its own rate, so only a `resample`
+            operation changes it; a number resamples every phrase and background to it
+            when they are loaded.
         speech: Sources of the phrases that every speech condition corrupts.
         backgrounds: Background pools by name, referred to by `mix`, `pad` and `generate`.
         conditions: The corruptions; names must be unique.
@@ -422,7 +431,7 @@ class Recipe(_Model):
     name: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
     seed: int
     plugins: list[Annotated[str, Field(pattern=_MODULE)]] = Field(default_factory=list)
-    sample_rate: int = Field(default=16000, gt=0)
+    sample_rate: Annotated[int, Field(gt=0)] | Literal["native"] = "native"
     speech: list[SpeechInput] = Field(min_length=1)
     backgrounds: dict[str, Background] = Field(default_factory=dict)
     conditions: list[Condition] = Field(min_length=1)

@@ -17,15 +17,17 @@ from testsets.recipe import Recipe
 _RATE = 16000
 
 
-def _write_tone(path: Path, seconds: float, hz: float, level: float = 0.1) -> None:
+def _write_tone(
+    path: Path, seconds: float, hz: float, level: float = 0.1, rate: int = _RATE
+) -> None:
     """Write a mono 16-bit wav tone; a stand-in for a phrase or a background clip."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    t = np.arange(int(_RATE * seconds)) / _RATE
+    t = np.arange(int(rate * seconds)) / rate
     pcm = np.round(level * np.sin(2 * np.pi * hz * t) * 32767).astype("<i2")
     with wave.open(str(path), "wb") as out:
         out.setnchannels(1)
         out.setsampwidth(2)
-        out.setframerate(_RATE)
+        out.setframerate(rate)
         out.writeframes(pcm.tobytes())
 
 
@@ -40,12 +42,15 @@ def inputs(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _recipe(root: Path, *conditions: dict[str, Any], take: int = 3) -> Recipe:
+def _recipe(
+    root: Path, *conditions: dict[str, Any], take: int = 3, sample_rate: int | str = _RATE
+) -> Recipe:
     """A recipe over the fixture folders with the given conditions."""
     return Recipe.model_validate(
         {
             "name": "tiny",
             "seed": 7,
+            "sample_rate": sample_rate,
             "speech": [
                 {
                     "source": {
@@ -317,3 +322,63 @@ def test_concat_groups_by_a_meta_key(tmp_path: Path) -> None:
 
     assert sorted(row["reference"] for row in rows) == ["a c", "b d"]
     assert all(row["meta"]["speaker"] == row["meta"]["concat_group"] for row in rows)
+
+
+def _rate_of(path: Path) -> int:
+    """Sample rate of a wav file."""
+    with wave.open(str(path)) as clip:
+        return clip.getframerate()
+
+
+def test_native_clean_copies_the_original_files(inputs: Path, tmp_path: Path) -> None:
+    """With `native`, a condition without operations is the source file, byte for byte."""
+    manifest = build(_recipe(inputs, sample_rate="native"), tmp_path / "out")
+
+    for row in _rows(manifest):
+        source = inputs / "speech" / Path(row["meta"]["source_id"]).with_suffix(".wav").name
+        assert (manifest.parent / row["audio"]).read_bytes() == source.read_bytes()
+
+
+def test_native_keeps_each_rate_until_resample(tmp_path: Path) -> None:
+    """An 8 kHz phrase stays 8 kHz under a 16 kHz background, and `resample` changes it."""
+    _write_tone(tmp_path / "speech" / "p0.wav", 1.0, 300, rate=8000)
+    _write_tone(tmp_path / "music" / "m0.wav", 3.0, 1000)
+    recipe = _recipe(
+        tmp_path,
+        {"name": "music", "ops": [{"mix": {"background": "music", "snr_db": 10}}]},
+        {"name": "wide", "ops": [{"resample": 16000}]},
+        take=1,
+        sample_rate="native",
+    )
+
+    rows = {row["meta"]["condition"]: row for row in _rows(build(recipe, tmp_path / "out"))}
+
+    out = tmp_path / "out" / "tiny"
+    assert _rate_of(out / rows["music"]["audio"]) == 8000
+    assert _rate_of(out / rows["wide"]["audio"]) == 16000
+
+
+def test_generate_has_its_own_rate(inputs: Path, tmp_path: Path) -> None:
+    """Clips made from nothing are 16 kHz under `native`, unless `generate` says otherwise."""
+    recipe = _recipe(
+        inputs,
+        {
+            "name": "z16",
+            "speech": "none",
+            "count": 1,
+            "ops": [{"generate": {"fill": "zero", "seconds": 1}}],
+        },
+        {
+            "name": "z8",
+            "speech": "none",
+            "count": 1,
+            "ops": [{"generate": {"fill": "music", "seconds": 1, "sample_rate": 8000}}],
+        },
+        sample_rate="native",
+    )
+
+    rows = {row["meta"]["condition"]: row for row in _rows(build(recipe, tmp_path / "out"))}
+
+    out = tmp_path / "out" / "tiny"
+    assert _rate_of(out / rows["z16"]["audio"]) == 16000
+    assert _rate_of(out / rows["z8"]["audio"]) == 8000

@@ -32,6 +32,9 @@ from testsets import ops
 from testsets.ops import Clip, Samples
 from testsets.recipe import Background, Concat, Condition, Range, Recipe, SpeechInput, load_recipe
 
+# Rate of clips made from nothing when the recipe keeps every file at its own rate.
+_DEFAULT_RATE = 16000
+
 
 @dataclass(frozen=True)
 class Phrase:
@@ -48,6 +51,8 @@ class Phrase:
             they are just the whole phrase.
         meta: The source record's metadata, plus what `concat` adds; it goes into the
             built record, so slice search can use the source's own columns.
+        origin: The source file, when `clip` is that whole file unchanged (its own rate,
+            all of it); a condition without operations then copies it byte for byte.
     """
 
     key: str
@@ -57,27 +62,39 @@ class Phrase:
     clip: Clip
     truth: str
     meta: dict[str, MetaValue] = field(default_factory=dict)
+    origin: Path | None = None
 
 
 @dataclass(frozen=True)
 class Pool:
-    """Background clips of one recipe background, decoded at the recipe's sample rate.
+    """Background clips of one recipe background, decoded once.
 
     Attributes:
-        clips: (clip id, samples) pairs.
+        clips: (clip id, clip) pairs, at the recipe's rate or, if it is `native`, at
+            each file's own rate.
         licenses: Number of clips in the pool under each license, for `sources.json`.
         used: How many built clips took a stretch of this pool, for `sources.json`.
     """
 
-    clips: list[tuple[str, Samples]]
+    clips: list[tuple[str, Clip]]
     licenses: Counter[str] = field(default_factory=Counter)
     used: Counter[str] = field(default_factory=Counter)
+    _resampled: dict[tuple[str, int], Samples] = field(default_factory=dict, init=False, repr=False)
 
-    def pick(self, rng: np.random.Generator) -> tuple[str, Samples]:
-        """Choose one clip at random and count it as used."""
-        clip_id, samples = self.clips[int(rng.integers(len(self.clips)))]
+    def pick(self, rng: np.random.Generator, sample_rate: int) -> tuple[str, Samples]:
+        """Choose one clip at random, count it as used, return it at `sample_rate`.
+
+        A whole background clip is resampled once per rate and kept, so a stretch of
+        it is cut from the same samples whichever clip it goes under.
+        """
+        clip_id, clip = self.clips[int(rng.integers(len(self.clips)))]
         self.used[clip_id] += 1
-        return clip_id, samples
+        if clip.sample_rate == sample_rate:
+            return clip_id, clip.samples
+        key = (clip_id, sample_rate)
+        if key not in self._resampled:
+            self._resampled[key] = ops.resample(clip, sample_rate).samples
+        return clip_id, self._resampled[key]
 
 
 @dataclass
@@ -90,7 +107,7 @@ class _Context:
     Attributes:
         rng: The clip's own generator.
         meta: What the clip's operations drew and noted.
-        sample_rate: The recipe's sample rate.
+        sample_rate: Rate of clips made from nothing (`OpContext.sample_rate`).
         pools: Decoded backgrounds by name, for `fill`.
     """
 
@@ -113,13 +130,13 @@ class _Context:
             name = f"{key}_{number}"
         self.meta[name] = value
 
-    def fill(self, fill: str, frames: int, floor_dbfs: float) -> Samples:
+    def fill(self, fill: str, frames: int, floor_dbfs: float, sample_rate: int) -> Samples:
         """Make `frames` of digital zero, a noise floor, or a random background stretch."""
         if fill == "zero":
             return ops.zeros(frames)
         if fill == "floor":
             return ops.noise_floor(frames, floor_dbfs, self.rng)
-        background_id, samples = self.pools[fill].pick(self.rng)
+        background_id, samples = self.pools[fill].pick(self.rng, sample_rate)
         self.note("background_id", background_id)
         return ops.excerpt(samples, frames, self.rng) if frames else ops.zeros(0)
 
@@ -133,6 +150,7 @@ class _Made:
     phrase: Phrase | None
     clip: Clip
     meta: dict[str, MetaValue]
+    copy: Path | None = None
 
 
 def build(recipe: Recipe, out_dir: Path, force: bool = False) -> Path:
@@ -149,7 +167,7 @@ def build(recipe: Recipe, out_dir: Path, force: bool = False) -> Path:
     shutil.rmtree(partial, ignore_errors=True)
     phrases = _load_phrases(recipe)
     pools = {
-        name: _load_pool(background, recipe.sample_rate)
+        name: _load_pool(background, _fixed_rate(recipe))
         for name, background in recipe.backgrounds.items()
     }
     run = _Build(recipe, pools)
@@ -175,7 +193,7 @@ def _load_phrases(recipe: Recipe) -> list[Phrase]:
     phrases: list[Phrase] = []
     for number, speech in enumerate(recipe.speech):
         rng = np.random.default_rng([recipe.seed, number])
-        candidates = _candidates(speech, recipe.sample_rate)
+        candidates = _candidates(speech, _fixed_rate(recipe))
         if speech.concat is not None:
             packer = _Packer(speech.concat, np.random.default_rng([recipe.seed, number, 1]))
             candidates = packer.pack(candidates)
@@ -193,13 +211,24 @@ def _load_phrases(recipe: Recipe) -> list[Phrase]:
     return phrases
 
 
-def _candidates(speech: SpeechInput, sample_rate: int) -> list[Phrase]:
-    """Decode an input's records and keep those within its duration filter."""
+def _fixed_rate(recipe: Recipe) -> int | None:
+    """The rate every input is resampled to on load, or None to keep each file's own."""
+    return None if recipe.sample_rate == "native" else recipe.sample_rate
+
+
+def _candidates(speech: SpeechInput, sample_rate: int | None) -> list[Phrase]:
+    """Decode an input's records and keep those within its duration filter.
+
+    `sample_rate` None keeps every file at its own rate.
+    """
     source = build_source(speech.source)
     candidates = []
     for record in source.records():
         spans = record.speech_segments
-        clip = Clip(load_audio(record, sample_rate).mono(), sample_rate, list(spans or []))
+        audio = load_audio(record, sample_rate)
+        clip = Clip(audio.mono(), audio.sample_rate, list(spans or []))
+        # Unchanged means: its own rate, every channel of the file (mono stays mono).
+        unchanged = sample_rate is None and record.channel is None and audio.samples.shape[0] == 1
         if speech.duration is not None and not (
             speech.duration[0] <= clip.seconds <= speech.duration[1]
         ):
@@ -215,6 +244,7 @@ def _candidates(speech: SpeechInput, sample_rate: int) -> list[Phrase]:
                 clip=clip,
                 truth="alignment" if spans is not None else "utterance_bounds",
                 meta=dict(record.meta),
+                origin=record.audio if unchanged else None,
             )
         )
     return candidates
@@ -314,14 +344,16 @@ def _length(parts: list[tuple[float, Phrase]]) -> float:
     return sum(gap + phrase.clip.seconds for gap, phrase in parts)
 
 
-def _load_pool(background: Background, sample_rate: int) -> Pool:
+def _load_pool(background: Background, sample_rate: int | None) -> Pool:
     """Decode a background's clips, keeping only those whose license is allowed.
+
+    `sample_rate` None keeps every clip at its file's rate; `Pool.pick` converts it.
 
     Raises:
         ValueError: If no clip is left after the license filter.
     """
     source = build_source(background.source)
-    clips: list[tuple[str, Samples]] = []
+    clips: list[tuple[str, Clip]] = []
     licenses: Counter[str] = Counter()
     for record in source.records():
         license_name = (
@@ -331,7 +363,8 @@ def _load_pool(background: Background, sample_rate: int) -> Pool:
         )
         if background.licenses is not None and license_name not in background.licenses:
             continue
-        clips.append((f"{source.name}/{record.id}", load_audio(record, sample_rate).mono()))
+        audio = load_audio(record, sample_rate)
+        clips.append((f"{source.name}/{record.id}", Clip(audio.mono(), audio.sample_rate, [])))
         licenses[license_name] += 1
     if not clips:
         raise ValueError(f"background source {source.name!r} has no clip with an allowed license")
@@ -359,14 +392,16 @@ class _Build:
         else:
             starts = [(phrase, phrase.clip) for phrase in phrases]
         salt = zlib.crc32(condition.name.encode())
+        made_rate = _fixed_rate(self.recipe) or _DEFAULT_RATE
         made = []
         for number, (phrase, clip) in enumerate(starts):
             rng = np.random.default_rng([self.recipe.seed, salt, number])
-            ctx = _Context(rng, {"condition": condition.name}, self.recipe.sample_rate, self.pools)
+            ctx = _Context(rng, {"condition": condition.name}, made_rate, self.pools)
             for op in condition.ops:
                 clip = op.make(ctx) if clip is None else op.apply(clip, ctx)
             assert clip is not None  # a no-speech condition starts with a clip-making op
-            made.append(_Made(condition, number, phrase, clip, ctx.meta))
+            copy = phrase.origin if phrase is not None and not condition.ops else None
+            made.append(_Made(condition, number, phrase, clip, ctx.meta, copy))
         return made
 
 
@@ -374,8 +409,14 @@ def _write_clip(root: Path, made: _Made) -> SampleRecord:
     """Write one clip as 16-bit wav and return its record, with the audio path relative."""
     phrase, meta = made.phrase, made.meta
     name = phrase.key if phrase is not None else f"{made.number:04d}"
-    relative = Path("audio") / made.condition.name / f"{name}.wav"
-    _write_wav(root / relative, made.clip)
+    folder = Path("audio") / made.condition.name
+    if made.copy is not None:  # the original file, untouched
+        relative = folder / f"{name}{made.copy.suffix.lower()}"
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(made.copy, root / relative)
+    else:
+        relative = folder / f"{name}.wav"
+        _write_wav(root / relative, made.clip)
     if phrase is not None:
         meta = {**phrase.meta, **meta, "source_id": phrase.key, "speech_truth": phrase.truth}
     return SampleRecord(

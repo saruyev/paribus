@@ -369,7 +369,7 @@ def drop_chunks(clip: Clip, rate: float, chunk_ms: float, rng: np.random.Generat
 class Dropout(Operation):
     """Packet loss: silence random chunks of `chunk_ms`, each lost with probability `rate`."""
 
-    rate: Range                      # settings are fields, validated when the recipe loads
+    rate: Range  # settings are fields, validated when the recipe loads
     chunk_ms: float = 20.0
 
     shorthand: ClassVar[str | None] = "rate"  # lets a recipe write `{dropout: 0.05}`
@@ -475,7 +475,7 @@ What to do with it:
 
   rows = pd.read_json("manifest.jsonl", lines=True)
   meta = pd.json_normalize(rows["meta"])
-  print(meta.groupby("condition").size())          # clips per condition
+  print(meta.groupby("condition").size())  # clips per condition
   print(meta.query("condition == 'noise_snr10'")["snr_db"].describe())
   ```
 
