@@ -11,7 +11,7 @@ speech:
       type: hf
       name: librispeech_en
       dataset: gilkeyio/librispeech-alignments
-      revision: PIN
+      revision: 0daa1eb43dda38ee6ce752e785555380e5628f5c
       split: test_clean
       id_column: id
       text_column: transcript
@@ -31,8 +31,8 @@ speech:
       type: hf
       name: fleurs_ru
       dataset: google/fleurs
-      revision: PIN   # a commit of refs/convert/parquet
-      subset: ru_ru
+      revision: 168de341b3db6859a9bac1c50a2ef5e3b47647e0   # a commit of refs/convert/parquet
+      data_dir: ru_ru   # the parquet branch keeps languages as folders, not configs
       split: test
       text_column: raw_transcription
       transcripts: reference
@@ -48,7 +48,7 @@ backgrounds:
       type: hf
       name: musan_music
       dataset: Akiki-AI/akiki-vad-silero623-v1-musan-music-cc-by-3.0
-      revision: PIN
+      revision: 20f2d02ac697dc7bb56bed8e7c2012072ea3fa20
       split: train
       id_column: sample_id
       license: CC-BY-3.0
@@ -57,7 +57,7 @@ backgrounds:
       type: hf
       name: musan_noise
       dataset: Akiki-AI/akiki-vad-silero623-v1-musan-noise
-      revision: PIN
+      revision: 4eff67313a8e62bb6d054af54593f038d267c90f
       split: train
       id_column: sample_id
       meta_columns: [audio_license]

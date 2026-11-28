@@ -554,4 +554,4 @@ What to do with it:
   English and Russian speech, 13 conditions with speech and 4 without, about 1,500 clips.
 - `recipes/t0-long.yaml`: long LibriSpeech clips (30 s to 5 min) under 5 conditions.
 
-Revisions marked `PIN` must be replaced with commit shas before building.
+Every revision in them is pinned to a commit sha, so they build the same sets anywhere.
