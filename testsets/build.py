@@ -39,6 +39,7 @@ from testsets.recipe import (
     Mix,
     Op,
     Pad,
+    Range,
     Recipe,
     Resample,
     SpeechInput,
@@ -75,10 +76,40 @@ class Pool:
 
 
 @dataclass
-class _Usage:
-    """What a build took from each input, for `sources.json`."""
+class _Draw:
+    """One clip's random generator, and the record in `meta` of what it drew.
 
-    clips: Counter[str] = field(default_factory=Counter)
+    Every drawn setting is written down, so slice search can later tell which SNR or
+    pad length a clip got.
+    """
+
+    rng: np.random.Generator
+    meta: dict[str, MetaValue]
+
+    def value(self, key: str, setting: Range, digits: int) -> float:
+        """Draw a setting (fixed or a range), record it rounded under `key`, return it."""
+        drawn = ops.draw(setting, self.rng)
+        self.note(key, round(drawn, digits))
+        return drawn
+
+    def note(self, key: str, value: MetaValue) -> None:
+        """Set `meta[key]`, or `key_2`, `key_3`... when an operation repeats in a condition."""
+        name, number = key, 1
+        while name in self.meta:
+            number += 1
+            name = f"{key}_{number}"
+        self.meta[name] = value
+
+
+@dataclass(frozen=True)
+class _Made:
+    """A finished clip and what is known about it, ready to be written."""
+
+    condition: Condition
+    number: int
+    phrase: Phrase | None
+    clip: Clip
+    meta: dict[str, MetaValue]
 
 
 def build(recipe: Recipe, out_dir: Path, force: bool = False) -> Path:
@@ -98,14 +129,14 @@ def build(recipe: Recipe, out_dir: Path, force: bool = False) -> Path:
         name: _load_pool(background, recipe.sample_rate)
         for name, background in recipe.backgrounds.items()
     }
-    usage = _Usage()
+    run = _Build(recipe, pools, Counter())
     records = [
-        _write_clip(partial, condition, number, clip, meta, phrase)
+        _write_clip(partial, made)
         for condition in recipe.conditions
-        for number, phrase, clip, meta in _clips(recipe, condition, phrases, pools, usage)
+        for made in run.clips(condition, phrases)
     ]
     _write_manifest(partial / "manifest.jsonl", records)
-    _write_sources(partial / "sources.json", recipe, pools, usage)
+    _write_sources(partial / "sources.json", recipe, pools, run.used)
     shutil.rmtree(target, ignore_errors=True)
     partial.rename(target)
     return target / "manifest.jsonl"
@@ -181,126 +212,96 @@ def _load_pool(background: Background, sample_rate: int) -> Pool:
     return Pool(clips=clips, licenses=licenses)
 
 
-def _clips(
-    recipe: Recipe,
-    condition: Condition,
-    phrases: list[Phrase],
-    pools: Mapping[str, Pool],
-    usage: _Usage,
-) -> list[tuple[int, Phrase | None, Clip, dict[str, MetaValue]]]:
-    """Make every clip of one condition: one per phrase, or `count` without speech."""
-    salt = zlib.crc32(condition.name.encode())
-    if condition.speech == "none":
-        assert condition.count is not None  # guaranteed by Condition's validator
-        starts: list[tuple[Phrase | None, Clip | None]] = [(None, None)] * condition.count
-    else:
-        starts = [
-            (phrase, Clip(phrase.samples, recipe.sample_rate, phrase.speech)) for phrase in phrases
-        ]
-    made = []
-    for number, (phrase, clip) in enumerate(starts):
-        rng = np.random.default_rng([recipe.seed, salt, number])
-        meta: dict[str, MetaValue] = {"condition": condition.name}
-        for op in condition.ops:
-            clip = _apply(op, clip, rng, recipe.sample_rate, pools, meta, usage)
-        assert clip is not None  # a no-speech condition starts with generate
-        made.append((number, phrase, clip, meta))
-    return made
+@dataclass(frozen=True)
+class _Build:
+    """What stays the same for a whole build: the recipe, the backgrounds, their use.
+
+    Attributes:
+        recipe: The recipe being built.
+        pools: Decoded background clips by background name.
+        used: How many clips took each background clip, by its id, for `sources.json`.
+    """
+
+    recipe: Recipe
+    pools: Mapping[str, Pool]
+    used: Counter[str]
+
+    def clips(self, condition: Condition, phrases: list[Phrase]) -> list[_Made]:
+        """Make every clip of one condition: one per phrase, or `count` without speech."""
+        rate = self.recipe.sample_rate
+        starts: list[tuple[Phrase | None, Clip | None]]
+        if condition.speech == "none":
+            assert condition.count is not None  # guaranteed by Condition's validator
+            starts = [(None, None)] * condition.count
+        else:
+            starts = [(phrase, Clip(phrase.samples, rate, phrase.speech)) for phrase in phrases]
+        salt = zlib.crc32(condition.name.encode())
+        made = []
+        for number, (phrase, clip) in enumerate(starts):
+            draw = _Draw(np.random.default_rng([self.recipe.seed, salt, number]), {})
+            draw.meta["condition"] = condition.name
+            for op in condition.ops:
+                clip = self.apply(op, clip, draw)
+            assert clip is not None  # a no-speech condition starts with generate
+            made.append(_Made(condition, number, phrase, clip, draw.meta))
+        return made
+
+    def apply(self, op: Op, clip: Clip | None, draw: _Draw) -> Clip:
+        """Apply one operation, drawing its settings through `draw`."""
+        if isinstance(op, Generate):
+            rate = self.recipe.sample_rate
+            frames = int(draw.value("seconds", op.seconds, 3) * rate)
+            return ops.generate(self.fill(op.fill, frames, op.floor_dbfs, draw), rate)
+        assert clip is not None  # only generate starts from nothing
+        if isinstance(op, Mix):
+            snr_db = draw.value("snr_db", op.snr_db, 2)
+            return ops.mix(clip, self.fill(op.background, clip.frames, 0.0, draw), snr_db)
+        if isinstance(op, Pad):
+            rate = clip.sample_rate
+            before = int(ops.draw(op.before, draw.rng) * rate)
+            after = int(ops.draw(op.after, draw.rng) * rate)
+            # Recorded from the frame counts, so the meta matches the audio exactly.
+            draw.note("pad_before", round(before / rate, 3))
+            draw.note("pad_after", round(after / rate, 3))
+            filler = self.fill(op.fill, before + after, op.floor_dbfs, draw)
+            return ops.pad(clip, filler[:before], filler[before:])
+        if isinstance(op, Resample):
+            draw.note("sample_rate_out", op.rate)
+            return ops.resample(clip, op.rate)
+        if isinstance(op, Codec):
+            draw.note("codec", op.name if op.bitrate is None else f"{op.name}@{op.bitrate}")
+            return ops.codec(clip, op.name, op.bitrate)
+        if isinstance(op, Gain):
+            return ops.gain(clip, draw.value("gain_db", op.db, 2))
+        raise TypeError(f"unhandled operation {op!r}")
+
+    def fill(self, fill: str, frames: int, floor_dbfs: float, draw: _Draw) -> Samples:
+        """Make `frames` of digital zero, a noise floor, or a random background stretch."""
+        if fill == "zero":
+            return ops.zeros(frames)
+        if fill == "floor":
+            return ops.noise_floor(frames, floor_dbfs, draw.rng)
+        clips = self.pools[fill].clips
+        background_id, samples = clips[int(draw.rng.integers(len(clips)))]
+        draw.note("background_id", background_id)
+        self.used[background_id] += 1
+        return ops.excerpt(samples, frames, draw.rng) if frames else ops.zeros(0)
 
 
-def _apply(
-    op: Op,
-    clip: Clip | None,
-    rng: np.random.Generator,
-    sample_rate: int,
-    pools: Mapping[str, Pool],
-    meta: dict[str, MetaValue],
-    usage: _Usage,
-) -> Clip:
-    """Apply one operation, drawing its ranges and recording what was drawn in `meta`."""
-    if isinstance(op, Generate):
-        seconds = ops.draw(op.seconds, rng)
-        _put(meta, "seconds", round(seconds, 3))
-        frames = int(seconds * sample_rate)
-        return ops.generate(
-            _fill(op.fill, frames, op.floor_dbfs, rng, pools, meta, usage), sample_rate
-        )
-    assert clip is not None  # only generate starts from nothing
-    if isinstance(op, Mix):
-        snr_db = ops.draw(op.snr_db, rng)
-        _put(meta, "snr_db", round(snr_db, 2))
-        background = _fill(op.background, clip.frames, 0.0, rng, pools, meta, usage)
-        return ops.mix(clip, background, snr_db)
-    if isinstance(op, Pad):
-        before = int(ops.draw(op.before, rng) * clip.sample_rate)
-        after = int(ops.draw(op.after, rng) * clip.sample_rate)
-        _put(meta, "pad_before", round(before / clip.sample_rate, 3))
-        _put(meta, "pad_after", round(after / clip.sample_rate, 3))
-        filler = _fill(op.fill, before + after, op.floor_dbfs, rng, pools, meta, usage)
-        return ops.pad(clip, filler[:before], filler[before:])
-    if isinstance(op, Resample):
-        _put(meta, "sample_rate_out", op.rate)
-        return ops.resample(clip, op.rate)
-    if isinstance(op, Codec):
-        _put(meta, "codec", op.name if op.bitrate is None else f"{op.name}@{op.bitrate}")
-        return ops.codec(clip, op.name, op.bitrate)
-    if isinstance(op, Gain):
-        db = ops.draw(op.db, rng)
-        _put(meta, "gain_db", round(db, 2))
-        return ops.gain(clip, db)
-    raise TypeError(f"unhandled operation {op!r}")
-
-
-def _fill(
-    fill: str,
-    frames: int,
-    floor_dbfs: float,
-    rng: np.random.Generator,
-    pools: Mapping[str, Pool],
-    meta: dict[str, MetaValue],
-    usage: _Usage,
-) -> Samples:
-    """Make `frames` of a fill: digital zero, a noise floor, or a random background stretch."""
-    if fill == "zero":
-        return ops.zeros(frames)
-    if fill == "floor":
-        return ops.noise_floor(frames, floor_dbfs, rng)
-    clips = pools[fill].clips
-    background_id, samples = clips[int(rng.integers(len(clips)))]
-    _put(meta, "background_id", background_id)
-    usage.clips[background_id] += 1
-    return ops.excerpt(samples, frames, rng) if frames else ops.zeros(0)
-
-
-def _put(meta: dict[str, MetaValue], key: str, value: MetaValue) -> None:
-    """Set `meta[key]`, or `key_2`, `key_3`... when an operation repeats in a condition."""
-    name, number = key, 1
-    while name in meta:
-        number += 1
-        name = f"{key}_{number}"
-    meta[name] = value
-
-
-def _write_clip(
-    root: Path,
-    condition: Condition,
-    number: int,
-    clip: Clip,
-    meta: dict[str, MetaValue],
-    phrase: Phrase | None,
-) -> SampleRecord:
+def _write_clip(root: Path, made: _Made) -> SampleRecord:
     """Write one clip as 16-bit wav and return its record, with the audio path relative."""
-    name = phrase.key if phrase is not None else f"{number:04d}"
-    relative = Path("audio") / condition.name / f"{name}.wav"
-    _write_wav(root / relative, clip)
+    phrase, meta = made.phrase, made.meta
+    name = phrase.key if phrase is not None else f"{made.number:04d}"
+    relative = Path("audio") / made.condition.name / f"{name}.wav"
+    _write_wav(root / relative, made.clip)
     if phrase is not None:
         meta = {**meta, "source_id": phrase.key, "speech_truth": phrase.truth}
     return SampleRecord(
-        id=f"{condition.name}/{name}",
+        id=f"{made.condition.name}/{name}",
         audio=relative,
         language=phrase.record.language if phrase else None,
         reference=phrase.record.reference if phrase else None,
-        speech_segments=[(round(start, 4), round(end, 4)) for start, end in clip.speech],
+        speech_segments=[(round(start, 4), round(end, 4)) for start, end in made.clip.speech],
         meta=meta,
     )
 
@@ -326,19 +327,22 @@ def _write_manifest(path: Path, records: list[SampleRecord]) -> None:
             out.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _write_sources(path: Path, recipe: Recipe, pools: Mapping[str, Pool], usage: _Usage) -> None:
+def _write_sources(
+    path: Path, recipe: Recipe, pools: Mapping[str, Pool], used: Counter[str]
+) -> None:
     """Write every input with its full config (dataset, revision) and license."""
     inputs: list[dict[str, Any]] = [
         {"role": "speech", "source": speech.source, "take": speech.take} for speech in recipe.speech
     ]
     for name, background in recipe.backgrounds.items():
-        used = sum(count for clip, count in usage.clips.items() if clip in dict(pools[name].clips))
+        ids = {clip_id for clip_id, _ in pools[name].clips}
+        taken = sum(count for clip_id, count in used.items() if clip_id in ids)
         inputs.append(
             {
                 "role": f"background:{name}",
                 "source": background.source,
                 "clips_in_pool_by_license": dict(sorted(pools[name].licenses.items())),
-                "clips_used": used,
+                "clips_used": taken,
             }
         )
     document = {"recipe": recipe.name, "seed": recipe.seed, "inputs": inputs}
