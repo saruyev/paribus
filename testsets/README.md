@@ -272,15 +272,29 @@ phrases.
 |---|---|---|
 | `mix` | `background`, `snr_db` | Adds a background under the speech. The SNR is measured on the speech spans only, so padding does not skew it. |
 | `pad` | `before`, `after`, `fill`, `floor_dbfs` | Adds seconds before and after. `fill` is `zero` (digital silence), `floor` (white noise at `floor_dbfs`, default -60) or a background name. |
-| `generate` | `fill`, `seconds`, `floor_dbfs` | Makes a clip with no speech. It must be the first op of a `speech: none` condition, which also needs `count`. |
+| `generate` | `fill`, `seconds`, `floor_dbfs`, `sample_rate`, `channels` | Makes a clip with no speech. It must be the first op of a `speech: none` condition, which also needs `count`. The rate defaults to the recipe's, or 16000 under `native`; `channels` defaults to 1. |
 | `resample` | `rate` | Changes the sample rate, for example 8000 for narrowband telephony. |
 | `codec` | `name`, `bitrate` | Encodes and decodes with `pcm_mulaw`, `pcm_alaw` or `opus` (`bitrate` is for opus only), keeping the artifacts. |
 | `gain` | `db` | Changes the level. It clips at full scale, because clipping is a corruption worth testing too. |
+| `split` | `seconds`, `overlap` | Cuts the clip into windows, as a pipeline does before sending long audio to a model. The operations after it run on each piece (see below). |
 
 Any number can be a fixed value or a `[low, high]` range drawn per clip. Whatever was
 drawn is written into the clip's `meta`. An operation with one main setting can be written
 bare: `{resample: 8000}`, `{codec: opus}`, `{gain: -20}`. Otherwise settings are a
 mapping: `{mix: {background: music, snr_db: 5}}`.
+
+**Sample rate and channels.** By default nothing is converted behind your back:
+
+```yaml
+sample_rate: native   # every file keeps its own rate; or a number, e.g. 16000, for all
+channels: keep        # a stereo call stays stereo; or `mono` to average the channels
+```
+
+Under `native`, only a `resample` operation changes a clip's rate, so where you put it is
+part of the experiment. Backgrounds are converted to the rate of the clip they go under.
+They are always mono and go on every channel the same way, and `mix` measures the SNR
+over all channels together. The speech truth is one list for the whole file, not one per
+channel.
 
 Common recipes:
 
@@ -310,18 +324,21 @@ conditions:
 If an operation repeats in one condition, its meta keys get suffixes: `pad_before`,
 `pad_before_2`.
 
-**A dataset as it is.** A condition with no operations, like `clean`, keeps the
-phrases undamaged. They are still converted to mono 16-bit wav at the recipe's
-`sample_rate` (16 kHz by default), and you still get `take`, `duration` and the manifest.
-A recipe with only `clean` is a way to cut a fixed, reproducible sample out of a large
-dataset:
+**A dataset as it is.** With the defaults (`native`, `keep`), a condition with no
+operations, like `clean`, copies each source file byte for byte, in its own format: an mp3
+stays an mp3. You still get `take`, `duration` and the manifest, so a recipe with only
+`clean` cuts a fixed, reproducible sample out of a large dataset:
 
 ```yaml
 conditions:
   - name: clean
 ```
 
-If you want neither a sample nor a conversion, you do not need `testsets` at all. paribus
+A file is copied only when nothing about it changed. With a fixed `sample_rate`,
+`channels: mono` on a multichannel file, a source record that picks one `channel`, or
+`concat`, the clip is written as 16-bit wav instead.
+
+If you need neither a sample nor a manifest, you do not need `testsets` at all. paribus
 reads `hf`, `folder` and `manifest` sources directly, with the same settings as above.
 
 **Long clips.** `concat` on a speech input joins consecutive phrases of one group, such
@@ -337,6 +354,29 @@ input:
       gap: [0.3, 1.0]                 # silence between phrases
       group_by: id_prefix             # 1089-134686-0000 -> chapter 1089-134686
 ```
+
+The phrases of a `concat` input must share one sample rate and one channel count, or
+the build stops before joining anything. Joining them otherwise would need a silent
+conversion. Set `sample_rate` to a number and `channels: mono` to join mixed files.
+
+**Cutting into pieces.** `split` cuts a clip into windows, and every operation after it
+runs on each piece separately. Each piece is its own record in the output, with
+`group_id` (the whole clip), `offset` (where the piece starts in it) and speech spans
+local to the piece. That is how paribus sees audio a pipeline has already chunked.
+
+The order of operations is then the experiment. For example, does it matter whether you
+resample the original file or each chunk?
+
+```yaml
+conditions:
+  - {name: resample_whole,  ops: [{resample: 8000}, {split: 30}]}
+  - {name: resample_pieces, ops: [{split: 30}, {resample: 8000}]}
+```
+
+Both give the same pieces with the same offsets and speech spans, so they line up piece
+by piece. Only the samples differ, near the cuts. `split` takes `{seconds: [20, 40],
+overlap: 1}` too: the window length is drawn once per clip, and windows overlap by
+`overlap` seconds.
 
 ### 4. Add your own logic
 
@@ -401,12 +441,22 @@ Your part of the contract:
 - **Randomness comes from `ctx.rng` only.** Then rebuilds stay byte-identical.
 - **Draw settings with `ctx.value(key, setting, digits)`,** or record a value with
   `ctx.note(key, value)`. It shows up in the clip's `meta`, so results can be sliced by it.
+- **`clip.samples` is shaped (channels, frames)**, float32 in [-1, 1]; mono is one
+  channel. Index frames as `samples[:, start:end]`. Writing `samples[:n]` slices
+  *channels*, and silently does the wrong thing. Use `clip.channels`, `clip.frames` and
+  `clip.sample_rate` rather than the array's shape. A `Clip` with a one-dimensional array
+  is refused.
 - **Keep `clip.speech` true.** If you shift or cut audio, shift or cut the spans too, the
   way `pad` does. Dropping chunks leaves them as they are, because the speaker did talk there.
-- **Backgrounds come from `ctx.fill(name, frames, floor_dbfs)`.** Override `backgrounds()`
-  so the recipe checks that the ones you use exist.
+- **Backgrounds come from `ctx.fill(name, frames, floor_dbfs, sample_rate)`.** It returns
+  mono `(frames,)` at the rate you ask for, usually `clip.sample_rate`. Put it on every
+  channel with `samples + fill[None, :]`. Override `backgrounds()` so the recipe checks
+  that the ones you use exist.
 - **To make clips without speech,** set `starts_clip = True` and override `make(ctx)`
-  instead of `apply`, the way `generate` does.
+  instead of `apply`, the way `generate` does. `ctx.sample_rate` is the rate to use when
+  nothing else says.
+- **To turn one clip into several,** set `splits = True` and override `expand(clip, ctx)`
+  to return the pieces, the way `split` does. Give each piece an `offset`.
 
 Keep the signal processing in a plain function, like `drop_chunks` above, and test it
 directly with a synthetic tone and a seeded `np.random.default_rng(0)`. The class only
@@ -421,7 +471,9 @@ plugins you trust.
 
 ```
 <out>/<recipe name>/
-├── audio/<condition>/<source>/<id>.wav   # mono 16-bit PCM, at the clip's final rate
+├── audio/<condition>/<source>/<id>.wav   # 16-bit PCM, its channels, its final rate
+│                                         # (a copied original keeps its own format;
+│                                         #  a piece of `split` is .../<id>/<part>.wav)
 ├── manifest.jsonl                        # one record per clip
 └── sources.json                          # every input with revision, license and use; plugins
 ```
@@ -461,6 +513,10 @@ What the fields mean:
 - Columns you asked for with `meta_columns` (`sex` here) are carried over, so you can
   slice by speaker, channel, or whatever your data has.
 - Clips without speech have no `reference` and an empty `speech_segments`.
+- Pieces of a `split` also have `group_id` (the whole clip, `<condition>/<source>/<id>`),
+  `offset` (seconds into it) and `meta.split_part`. Their `speech_segments` are local:
+  add `offset` to get time in the whole clip. `reference` is still the whole phrase's,
+  because which words fall into which piece is not known without word timings.
 
 What to do with it:
 
